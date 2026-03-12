@@ -38,6 +38,8 @@ class GPTConfig:
     n_kv_head: int = 6
     n_embd: int = 768
     window_pattern: str = "SSSL"
+    simplicial_window: int = 0
+    simplicial_scale: float = 0.0
 
 
 def norm(x):
@@ -47,6 +49,10 @@ def norm(x):
 def has_ve(layer_idx, n_layer):
     """Returns True if layer should have Value Embedding (alternating, last always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
+
+
+def has_simplicial(layer_idx, n_layer):
+    return layer_idx == n_layer - 1
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -71,14 +77,49 @@ class CausalSelfAttention(nn.Module):
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.simplex_window = config.simplicial_window if has_simplicial(layer_idx, config.n_layer) else 0
+        self.simplicial_scale = config.simplicial_scale
+        self.c_k2 = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False) if self.simplex_window else None
+        self.c_v2 = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False) if self.simplex_window else None
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+
+    def _local_simplicial_attention(self, q, k, k2, v, v2):
+        assert q.size(1) == k.size(1) == k2.size(1) == v.size(1) == v2.size(1)
+        B, H, T, D = q.shape
+        window = min(self.simplex_window, T)
+        if window <= 1:
+            return torch.zeros_like(q)
+
+        def build_windows(t):
+            pad = torch.zeros(B, H, window - 1, D, dtype=t.dtype, device=t.device)
+            t = torch.cat((pad, t), dim=2)
+            return t.unfold(2, window, 1).permute(0, 1, 2, 4, 3).contiguous()
+
+        k_win = build_windows(k)
+        k2_win = build_windows(k2)
+        v_win = build_windows(v)
+        v2_win = build_windows(v2)
+
+        qk = q.unsqueeze(3) * k_win
+        logits = torch.einsum('bhtwd,bhtkd->bhtwk', qk, k2_win) / math.sqrt(D)
+
+        valid_counts = torch.clamp(torch.arange(1, T + 1, device=q.device), max=window)
+        valid = torch.arange(window, device=q.device).unsqueeze(0) >= (window - valid_counts).unsqueeze(1)
+        triangle_mask = valid.unsqueeze(2) & valid.unsqueeze(1)
+        logits = logits.float().masked_fill(~triangle_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+
+        alpha = logits.reshape(B, H, T, window * window).softmax(dim=-1).reshape(B, H, T, window, window).to(q.dtype)
+        tmp = torch.einsum('bhtjk,bhtkd->bhtjd', alpha, v2_win)
+        return (v_win * tmp).sum(dim=3) / math.sqrt(D)
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        k2 = self.c_k2(x).view(B, T, self.n_kv_head, self.head_dim) if self.c_k2 is not None else None
+        v2 = self.c_v2(x).view(B, T, self.n_kv_head, self.head_dim) if self.c_v2 is not None else None
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
@@ -88,9 +129,22 @@ class CausalSelfAttention(nn.Module):
 
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        if k2 is not None:
+            k2 = apply_rotary_emb(k2, cos, sin)
         q, k = norm(q), norm(k)
+        if k2 is not None:
+            k2 = norm(k2)
 
         y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if k2 is not None:
+            simplex_y = self._local_simplicial_attention(
+                q.permute(0, 2, 1, 3),
+                k.permute(0, 2, 1, 3),
+                k2.permute(0, 2, 1, 3),
+                v.permute(0, 2, 1, 3),
+                v2.permute(0, 2, 1, 3),
+            ).permute(0, 2, 1, 3)
+            y = y + self.simplicial_scale * simplex_y
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -158,6 +212,9 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+            if block.attn.c_k2 is not None:
+                torch.nn.init.uniform_(block.attn.c_k2.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_v2.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
@@ -433,6 +490,8 @@ class MuonAdamW(torch.optim.Optimizer):
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+SIMPLICIAL_WINDOW = 8   # exact ordered triangle window in the final layer only
+SIMPLICIAL_SCALE = 0.1  # conservative mix-in for the simplicial path
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**18 # ~262K tokens per optimizer step
@@ -474,6 +533,8 @@ def build_model_config(depth):
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
+        simplicial_window=SIMPLICIAL_WINDOW,
+        simplicial_scale=SIMPLICIAL_SCALE,
     )
 
 config = build_model_config(DEPTH)

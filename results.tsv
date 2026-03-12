@@ -3,3 +3,4 @@ c2450ad	0.000000	0.0	crash	stock baseline on A10G (device_batch=128) OOM during 
 18a1557	0.000000	0.0	crash	A10G-fit baseline with device_batch=64 still OOM on logits allocation
 5a54379	1.200115	11.4	keep	A10G-fit baseline with device_batch=32 and total_batch=2**18
 48470ac	1.220857	13.8	drop	final-layer local 2-simplicial attention (window=8, scale=0.1) fits on A10G but regresses quality, throughput, and VRAM
+7da9d05	1.221492	13.8	drop	final-layer local 2-simplicial attention (window=8, scale=0.05) matches Attempt 003 operationally but still regresses quality

@@ -1,0 +1,2 @@
+attempt,commit,status,device,val_bpb,training_seconds,total_seconds,peak_vram_gb,mfu_percent,total_tokens_M,num_steps,num_params_M,depth,delta_vs_attempt003_bpb,delta_vs_baseline_bpb,record_status
+"Attempt 004: Final-Layer Local 2-Simplicial Attention (window=8, scale=0.05)",7da9d05,completed,modal A10G 24GB,1.221492,300.5,411.3,13.8,4.27,55.1,210,50.9,8,0.000635,0.021377,not a campaign record

@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="420" viewBox="0 0 820 420">
+<rect width="100%" height="100%" fill="#f8fafc"/>
+<text x="56" y="34" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="700" fill="#111827">Track A3 fixed-scale comparison</text>
+<text x="56" y="54" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#475569">Reducing the final-layer simplicial residual scale from 0.1 to 0.05 did not recover the baseline gap under the 5-minute budget.</text>
+
+<rect x="56" y="86" width="348" height="252" rx="14" fill="#ffffff" stroke="#cbd5e1"/>
+<text x="76" y="112" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="700" fill="#111827">Validation bpb (lower is better)</text>
+<line x1="76" y1="300" x2="384" y2="300" stroke="#0f172a" stroke-width="1.5"/>
+<line x1="76" y1="140" x2="76" y2="300" stroke="#0f172a" stroke-width="1.5"/>
+<line x1="76" y1="300" x2="384" y2="300" stroke="#e2e8f0" stroke-width="1"/>
+<line x1="76" y1="246.7" x2="384" y2="246.7" stroke="#e2e8f0" stroke-width="1"/>
+<line x1="76" y1="193.3" x2="384" y2="193.3" stroke="#e2e8f0" stroke-width="1"/>
+<line x1="76" y1="140" x2="384" y2="140" stroke="#e2e8f0" stroke-width="1"/>
+<text x="66" y="304" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#475569">1.23</text>
+<text x="66" y="250.7" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#475569">1.22</text>
+<text x="66" y="197.3" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#475569">1.21</text>
+<text x="66" y="144" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#475569">1.20</text>
+<rect x="112" y="140.6" width="58" height="159.4" rx="8" fill="#2563eb"/>
+<rect x="202" y="251.4" width="58" height="48.6" rx="8" fill="#dc2626"/>
+<rect x="292" y="254.8" width="58" height="45.2" rx="8" fill="#ea580c"/>
+<text x="141" y="132.6" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#111827">1.2001</text>
+<text x="231" y="243.4" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#111827">1.2209</text>
+<text x="321" y="246.8" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#111827">1.2215</text>
+<text x="141" y="324" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#111827">Attempt 002</text>
+<text x="231" y="324" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#111827">Attempt 003</text>
+<text x="321" y="324" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#111827">Attempt 004</text>
+<text x="230" y="350" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#475569">0.05 is slightly worse than 0.1 on final validation</text>
+
+<rect x="432" y="86" width="332" height="252" rx="14" fill="#ffffff" stroke="#cbd5e1"/>
+<text x="452" y="112" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="700" fill="#111827">Budget productivity</text>
+<text x="452" y="136" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#475569">Attempts 003 and 004 were operationally the same run shape.</text>
+<line x1="452" y1="300" x2="744" y2="300" stroke="#0f172a" stroke-width="1.5"/>
+<line x1="452" y1="156" x2="452" y2="300" stroke="#0f172a" stroke-width="1.5"/>
+<line x1="452" y1="300" x2="744" y2="300" stroke="#e2e8f0" stroke-width="1"/>
+<line x1="452" y1="252" x2="744" y2="252" stroke="#e2e8f0" stroke-width="1"/>
+<line x1="452" y1="204" x2="744" y2="204" stroke="#e2e8f0" stroke-width="1"/>
+<line x1="452" y1="156" x2="744" y2="156" stroke="#e2e8f0" stroke-width="1"/>
+<text x="442" y="304" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#475569">200</text>
+<text x="442" y="256" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#475569">213</text>
+<text x="442" y="208" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#475569">227</text>
+<text x="442" y="160" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#475569">240</text>
+<rect x="488" y="163.2" width="56" height="136.8" rx="8" fill="#2563eb"/>
+<rect x="584" y="264" width="56" height="36" rx="8" fill="#dc2626"/>
+<rect x="680" y="264" width="56" height="36" rx="8" fill="#ea580c"/>
+<text x="516" y="155.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#111827">238</text>
+<text x="612" y="256" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#111827">210</text>
+<text x="708" y="256" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#111827">210</text>
+<text x="516" y="324" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#111827">Attempt 002</text>
+<text x="612" y="324" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#111827">Attempt 003</text>
+<text x="708" y="324" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#111827">Attempt 004</text>
+<text x="598" y="350" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#475569">Steps completed in the 5-minute training budget</text>
+
+<text x="56" y="388" font-family="Helvetica, Arial, sans-serif" font-size="13" fill="#111827">Conclusion: fixed-scale adjustment alone is not enough; the next Track A3 branch should make the simplicial path learnably gated or near-zero-initialized.</text>
+</svg>

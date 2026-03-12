@@ -40,6 +40,7 @@ class GPTConfig:
     window_pattern: str = "SSSL"
     simplicial_window: int = 0
     simplicial_scale: float = 0.0
+    simplicial_learnable_scale: bool = False
 
 
 def norm(x):
@@ -79,6 +80,10 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.simplex_window = config.simplicial_window if has_simplicial(layer_idx, config.n_layer) else 0
         self.simplicial_scale = config.simplicial_scale
+        self.simplicial_gate = (
+            nn.Parameter(torch.tensor(config.simplicial_scale, dtype=torch.float32))
+            if self.simplex_window and config.simplicial_learnable_scale else None
+        )
         self.c_k2 = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False) if self.simplex_window else None
         self.c_v2 = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False) if self.simplex_window else None
         self.ve_gate_channels = 32
@@ -144,7 +149,8 @@ class CausalSelfAttention(nn.Module):
                 v.permute(0, 2, 1, 3),
                 v2.permute(0, 2, 1, 3),
             ).permute(0, 2, 1, 3)
-            y = y + self.simplicial_scale * simplex_y
+            scale = self.simplicial_gate.to(dtype=simplex_y.dtype) if self.simplicial_gate is not None else self.simplicial_scale
+            y = y + scale * simplex_y
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -282,8 +288,9 @@ class GPT(nn.Module):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
+        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters() if p.ndim >= 2)
+        transformer_scalars = sum(p.numel() for p in self.transformer.h.parameters() if p.ndim < 2)
+        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + transformer_scalars
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         return {
             'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
@@ -293,14 +300,17 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
+        transformer_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in transformer_params if p.ndim >= 2]
+        transformer_scalar_params = [p for p in transformer_params if p.ndim < 2]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+            len(lm_head_params) + len(value_embeds_params) + len(resid_params) +
+            len(x0_params) + len(transformer_scalar_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -311,6 +321,11 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        if transformer_scalar_params:
+            param_groups.append(dict(
+                kind='adamw', params=transformer_scalar_params, lr=scalar_lr * 0.1,
+                betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
@@ -491,7 +506,8 @@ ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 SIMPLICIAL_WINDOW = 8   # exact ordered triangle window in the final layer only
-SIMPLICIAL_SCALE = 0.05 # gentler mix-in for the simplicial path
+SIMPLICIAL_SCALE = 0.02 # small initial gate value for the simplicial path
+SIMPLICIAL_LEARNABLE_SCALE = True
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**18 # ~262K tokens per optimizer step
@@ -535,6 +551,7 @@ def build_model_config(depth):
         window_pattern=WINDOW_PATTERN,
         simplicial_window=SIMPLICIAL_WINDOW,
         simplicial_scale=SIMPLICIAL_SCALE,
+        simplicial_learnable_scale=SIMPLICIAL_LEARNABLE_SCALE,
     )
 
 config = build_model_config(DEPTH)
@@ -689,3 +706,6 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+simplicial_gates = [block.attn.simplicial_gate.item() for block in model.transformer.h if block.attn.simplicial_gate is not None]
+if simplicial_gates:
+    print(f"simplicial_gates: {', '.join(f'{gate:.4f}' for gate in simplicial_gates)}")

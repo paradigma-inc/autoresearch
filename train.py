@@ -491,7 +491,7 @@ ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 SIMPLICIAL_WINDOW = 8   # exact ordered triangle window in the final layer only
-SIMPLICIAL_SCALE = 0.1  # conservative mix-in for the simplicial path
+SIMPLICIAL_SCALE = 0.05 # gentler mix-in for the simplicial path
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**18 # ~262K tokens per optimizer step

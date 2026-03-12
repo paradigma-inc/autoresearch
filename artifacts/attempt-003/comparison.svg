@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="420" viewBox="0 0 760 420">
+<rect width="100%" height="100%" fill="#f8fafc"/>
+<text x="56" y="34" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="700" fill="#111827">Attempt 003 vs A10G baseline</text>
+<text x="56" y="54" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#475569">Exact local 2-simplicial attention in the final layer fit on the Modal A10G, but it lost quality and efficiency versus Attempt 002.</text>
+
+<rect x="56" y="86" width="300" height="250" rx="14" fill="#ffffff" stroke="#cbd5e1"/>
+<text x="76" y="112" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="700" fill="#111827">Validation bpb (lower is better)</text>
+<line x1="76" y1="296" x2="336" y2="296" stroke="#0f172a" stroke-width="1.5"/>
+<line x1="76" y1="136" x2="76" y2="296" stroke="#0f172a" stroke-width="1.5"/>
+<line x1="76" y1="296" x2="336" y2="296" stroke="#e2e8f0" stroke-width="1"/>
+<line x1="76" y1="242" x2="336" y2="242" stroke="#e2e8f0" stroke-width="1"/>
+<line x1="76" y1="188" x2="336" y2="188" stroke="#e2e8f0" stroke-width="1"/>
+<line x1="76" y1="136" x2="336" y2="136" stroke="#e2e8f0" stroke-width="1"/>
+<text x="66" y="300" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#475569">1.24</text>
+<text x="66" y="246" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#475569">1.23</text>
+<text x="66" y="192" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#475569">1.22</text>
+<text x="66" y="140" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#475569">1.21</text>
+<rect x="118" y="182.6" width="70" height="113.4" rx="8" fill="#2563eb"/>
+<rect x="222" y="224.1" width="70" height="71.9" rx="8" fill="#dc2626"/>
+<text x="153" y="174.6" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#111827">1.2001</text>
+<text x="257" y="216.1" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#111827">1.2209</text>
+<text x="153" y="320" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#111827">Attempt 002</text>
+<text x="257" y="320" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#111827">Attempt 003</text>
+<text x="206" y="344" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#475569">Delta: +0.0207 bpb</text>
+
+<rect x="404" y="86" width="300" height="250" rx="14" fill="#ffffff" stroke="#cbd5e1"/>
+<text x="424" y="112" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="700" fill="#111827">Peak VRAM (GB, lower is better)</text>
+<line x1="424" y1="296" x2="684" y2="296" stroke="#0f172a" stroke-width="1.5"/>
+<line x1="424" y1="136" x2="424" y2="296" stroke="#0f172a" stroke-width="1.5"/>
+<line x1="424" y1="296" x2="684" y2="296" stroke="#e2e8f0" stroke-width="1"/>
+<line x1="424" y1="242.7" x2="684" y2="242.7" stroke="#e2e8f0" stroke-width="1"/>
+<line x1="424" y1="189.3" x2="684" y2="189.3" stroke="#e2e8f0" stroke-width="1"/>
+<line x1="424" y1="136" x2="684" y2="136" stroke="#e2e8f0" stroke-width="1"/>
+<text x="414" y="300" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#475569">14</text>
+<text x="414" y="246.7" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#475569">13</text>
+<text x="414" y="193.3" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#475569">12</text>
+<text x="414" y="140" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#475569">11</text>
+<rect x="466" y="211.6" width="70" height="84.4" rx="8" fill="#2563eb"/>
+<rect x="570" y="158.3" width="70" height="137.7" rx="8" fill="#dc2626"/>
+<text x="501" y="203.6" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#111827">11.4</text>
+<text x="605" y="150.3" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#111827">13.8</text>
+<text x="501" y="320" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#111827">Attempt 002</text>
+<text x="605" y="320" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#111827">Attempt 003</text>
+<text x="554" y="344" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#475569">Delta: +2.4 GB</text>
+
+<text x="56" y="386" font-family="Helvetica, Arial, sans-serif" font-size="13" fill="#111827">5-minute budget productivity: Attempt 002 reached 238 steps / 62.4M tokens; Attempt 003 reached 210 steps / 55.1M tokens.</text>
+</svg>

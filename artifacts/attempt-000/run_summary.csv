@@ -1,0 +1,2 @@
+attempt,commit,status,device,val_bpb,peak_vram_gb,failure,notes
+Attempt 000: Baseline + 2-Simplicial Cost Envelope,c2450ad,failed,modal A10G 24GB,,,OOM during first forward compile at stock device_batch=128,Stock H100-tuned baseline does not fit the managed worker without batch changes.

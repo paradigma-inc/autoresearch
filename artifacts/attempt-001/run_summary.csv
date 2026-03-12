@@ -1,0 +1,2 @@
+attempt,commit,status,device,val_bpb,peak_vram_gb,failure,notes
+Attempt 001: A10G-Fit Baseline (device_batch=64),18a1557,failed,modal A10G 24GB,,,OOM on final logits allocation with device_batch=64,Memory pressure moved from early activations to the logits buffer; deeper hardware fit required.

@@ -1,0 +1,2 @@
+attempt,commit,status,device,val_bpb,training_seconds,total_seconds,peak_vram_gb,mfu_percent,total_tokens_M,num_steps,num_params_M,depth,record_status
+"Attempt 002: A10G-Fit Baseline (device_batch=32, total_batch=2**18)",5a54379,completed,modal A10G 24GB,1.200115,300.9,411.7,11.4,4.80,62.4,238,50.3,8,new campaign record (first successful run)

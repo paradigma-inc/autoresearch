@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="520" viewBox="0 0 900 520">
+<rect width="100%" height="100%" fill="#fffaf2"/>
+<text x="80" y="28" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="700" fill="#2a241f">2-simplicial ordered interaction cost envelope</text>
+<text x="80" y="48" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#5b534c">Sequence length = 2048. Bar height shows log10(total ordered triangle interactions per layer) for a local window.</text>
+<line x1="80" y1="50" x2="80" y2="430" stroke="#3c352f" stroke-width="1.5"/>
+<line x1="80" y1="430" x2="860" y2="430" stroke="#3c352f" stroke-width="1.5"/>
+<line x1="80" y1="439.3" x2="860" y2="439.3" stroke="#e5d8c7" stroke-width="1"/>
+<text x="70" y="443.3" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#5b534c">1e5</text>
+<line x1="80" y1="360.4" x2="860" y2="360.4" stroke="#e5d8c7" stroke-width="1"/>
+<text x="70" y="364.4" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#5b534c">1e6</text>
+<line x1="80" y1="281.5" x2="860" y2="281.5" stroke="#e5d8c7" stroke-width="1"/>
+<text x="70" y="285.5" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#5b534c">1e7</text>
+<line x1="80" y1="202.6" x2="860" y2="202.6" stroke="#e5d8c7" stroke-width="1"/>
+<text x="70" y="206.6" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#5b534c">1e8</text>
+<line x1="80" y1="123.7" x2="860" y2="123.7" stroke="#e5d8c7" stroke-width="1"/>
+<text x="70" y="127.7" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#5b534c">1e9</text>
+<line x1="80" y1="44.8" x2="860" y2="44.8" stroke="#e5d8c7" stroke-width="1"/>
+<text x="70" y="48.8" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#5b534c">1e10</text>
+<rect x="92.1" y="430.0" width="62.4" height="0.0" rx="4" fill="#d97706" opacity="0.9"/>
+<text x="123.3" y="448" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#3c352f">8</text>
+<rect x="178.8" y="382.5" width="62.4" height="47.5" rx="4" fill="#d97706" opacity="0.9"/>
+<text x="210.0" y="448" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#3c352f">16</text>
+<rect x="265.5" y="335.0" width="62.4" height="95.0" rx="4" fill="#d97706" opacity="0.9"/>
+<text x="296.7" y="448" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#3c352f">32</text>
+<rect x="352.1" y="287.5" width="62.4" height="142.5" rx="4" fill="#d97706" opacity="0.9"/>
+<text x="383.3" y="448" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#3c352f">64</text>
+<rect x="438.8" y="240.0" width="62.4" height="190.0" rx="4" fill="#d97706" opacity="0.9"/>
+<text x="470.0" y="448" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#3c352f">128</text>
+<rect x="525.5" y="192.5" width="62.4" height="237.5" rx="4" fill="#d97706" opacity="0.9"/>
+<text x="556.7" y="448" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#3c352f">256</text>
+<rect x="612.1" y="145.0" width="62.4" height="285.0" rx="4" fill="#d97706" opacity="0.9"/>
+<text x="643.3" y="448" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#3c352f">512</text>
+<rect x="698.8" y="97.5" width="62.4" height="332.5" rx="4" fill="#d97706" opacity="0.9"/>
+<text x="730.0" y="448" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#3c352f">1024</text>
+<rect x="785.5" y="50.0" width="62.4" height="380.0" rx="4" fill="#b91c1c" opacity="0.9"/>
+<text x="816.7" y="448" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#3c352f">2048</text>
+<text x="470.0" y="485" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="13" fill="#2a241f">Local window size</text>
+<text x="20" y="240.0" transform="rotate(-90 20 240.0)" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="13" fill="#2a241f">Total ordered triangle interactions per layer (log scale)</text>
+<rect x="610" y="72" width="18" height="18" rx="3" fill="#d97706"/><text x="636" y="86" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#3c352f">bounded local windows</text>
+<rect x="610" y="100" width="18" height="18" rx="3" fill="#b91c1c"/><text x="636" y="114" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#3c352f">full 2048-context exact triangles</text>
+</svg>

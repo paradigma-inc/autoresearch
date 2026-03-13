@@ -1,0 +1,2 @@
+attempt,commit,status,device,val_bpb,training_seconds,total_seconds,peak_vram_gb,mfu_percent,total_tokens_M,num_steps,num_params_M,depth,noble_rank,noble_targets,delta_vs_attempt006_bpb,delta_vs_attempt007_bpb,delta_vs_baseline_bpb,record_status
+"Attempt 008: NOBLE CosNet on MLP Projection Only (rank=32, XSA off)",7ab7b03,completed,modal A10G 24GB,1.285091,300.4,423.1,11.6,4.52,57.9,221,51.0,8,32,mlp_proj,+0.066083,+0.006611,+0.084976,not a campaign record

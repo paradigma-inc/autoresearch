@@ -7,3 +7,4 @@ c2450ad	0.000000	0.0	crash	stock baseline on A10G (device_batch=128) OOM during 
 c787626	1.222022	13.8	drop	learnable simplicial gate init=0.02 converged to -1.1394 and further regressed val_bpb while reducing completed steps to 204
 aa46bea	1.219008	13.9	drop	NOBLE CosNet MLP branches on c_fc and c_proj (rank=32, XSA off) beat recent simplicial negatives but still regress vs the baseline
 87782cb	1.278480	11.6	drop	NOBLE CosNet on c_fc only recovers throughput and memory but severely regresses val_bpb, so expansion-only placement is not viable
+7ab7b03	1.285091	11.6	drop	NOBLE CosNet on c_proj only also recovers throughput and memory but regresses even harder, so one-line placements are ruled out

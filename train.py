@@ -370,17 +370,31 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        transformer_params = list(self.transformer.h.parameters())
-        matrix_params = [p for p in transformer_params if p.ndim >= 2]
-        transformer_scalar_params = [p for p in transformer_params if p.ndim < 2]
+        transformer_named_params = list(self.transformer.h.named_parameters())
+        matrix_params = []
+        transformer_scalar_params = []
+        noble_matrix_params = []
+        noble_scalar_params = []
+        for name, p in transformer_named_params:
+            if ".noble_" in name:
+                if p.ndim >= 2:
+                    noble_matrix_params.append(p)
+                else:
+                    noble_scalar_params.append(p)
+            elif p.ndim >= 2:
+                matrix_params.append(p)
+            else:
+                transformer_scalar_params.append(p)
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
+        assert len(list(self.parameters())) == (
+            len(matrix_params) + len(noble_matrix_params) + len(embedding_params) +
             len(lm_head_params) + len(value_embeds_params) + len(resid_params) +
-            len(x0_params) + len(transformer_scalar_params))
+            len(x0_params) + len(transformer_scalar_params) + len(noble_scalar_params)
+        )
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -394,6 +408,18 @@ class GPT(nn.Module):
         if transformer_scalar_params:
             param_groups.append(dict(
                 kind='adamw', params=transformer_scalar_params, lr=scalar_lr * 0.1,
+                betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
+        if noble_scalar_params:
+            param_groups.append(dict(
+                kind='adamw', params=noble_scalar_params, lr=scalar_lr * 0.1,
+                betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
+        if noble_matrix_params:
+            # The low-rank branch introduces several tiny matrix shapes; keeping them out of
+            # the compiled Muon path avoids recompile churn while preserving Muon for the main model.
+            param_groups.append(dict(
+                kind='adamw', params=noble_matrix_params, lr=matrix_lr * 0.25,
                 betas=adam_betas, eps=1e-10, weight_decay=0.0,
             ))
         for shape in sorted({p.shape for p in matrix_params}):

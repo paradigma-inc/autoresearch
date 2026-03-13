@@ -1,0 +1,2 @@
+attempt,commit,status,device,val_bpb,training_seconds,total_seconds,peak_vram_gb,mfu_percent,total_tokens_M,num_steps,num_params_M,depth,noble_rank,delta_vs_attempt005_bpb,delta_vs_baseline_bpb,record_status
+"Attempt 006: NOBLE CosNet on MLP Linears (rank=32, XSA off)",aa46bea,completed,modal A10G 24GB,1.219008,301.0,425.2,13.9,4.16,53.7,205,50.9,8,32,-0.003014,+0.018893,not a campaign record

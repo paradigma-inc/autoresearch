@@ -626,14 +626,14 @@ class MuonAdamW(torch.optim.Optimizer):
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
-SIMPLICIAL_WINDOW = 0   # disabled for XSA-only control
+SIMPLICIAL_WINDOW = 0   # disabled for NOBLE controls
 SIMPLICIAL_SCALE = 0.0
 SIMPLICIAL_LEARNABLE_SCALE = False
 XSA_MODE = "off"        # "off", "final", or "all"
 XSA_EPS = 1e-6
 NOBLE_RANK = 32         # bottleneck rank for CosNet low-rank branches
 NOBLE_MLP_FC = True     # add a NOBLE branch to the MLP expansion linear
-NOBLE_MLP_PROJ = True   # add a NOBLE branch to the MLP projection linear
+NOBLE_MLP_PROJ = False  # keep the first placement-scope follow-up on c_fc only
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**18 # ~262K tokens per optimizer step

@@ -26,6 +26,32 @@ fa3 = get_kernel(repo).flash_attn_interface
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
 # ---------------------------------------------------------------------------
+# Environment helpers
+# ---------------------------------------------------------------------------
+
+def env_str(name, default):
+    value = os.getenv(name)
+    return value if value is not None else default
+
+
+def env_int(name, default):
+    value = os.getenv(name)
+    return int(value) if value is not None else default
+
+
+def env_float(name, default):
+    value = os.getenv(name)
+    return float(value) if value is not None else default
+
+
+def env_bool(name, default):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# ---------------------------------------------------------------------------
 # GPT Model
 # ---------------------------------------------------------------------------
 
@@ -43,6 +69,8 @@ class GPTConfig:
     simplicial_learnable_scale: bool = False
     xsa_mode: str = "off"
     xsa_eps: float = 1e-6
+    collect_attn_stats: bool = False
+    attn_stats_eps: float = 1e-6
 
 
 def norm(x):
@@ -70,6 +98,7 @@ def apply_rotary_emb(x, cos, sin):
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
+        self.layer_idx = layer_idx
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
@@ -85,6 +114,8 @@ class CausalSelfAttention(nn.Module):
             raise ValueError(f"Unsupported XSA mode: {config.xsa_mode}")
         self.use_xsa = xsa_mode == "all" or (xsa_mode == "final" and layer_idx == config.n_layer - 1)
         self.xsa_eps = config.xsa_eps
+        self.collect_attn_stats = config.collect_attn_stats
+        self.attn_stats_eps = config.attn_stats_eps
         self.simplex_window = config.simplicial_window if has_simplicial(layer_idx, config.n_layer) else 0
         self.simplicial_scale = config.simplicial_scale
         self.simplicial_gate = (
@@ -95,6 +126,11 @@ class CausalSelfAttention(nn.Module):
         self.c_v2 = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False) if self.simplex_window else None
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        if self.collect_attn_stats:
+            self.register_buffer("diag_cos_yv_sum", torch.zeros((), dtype=torch.float64), persistent=False)
+            self.register_buffer("diag_cos_yv_count", torch.zeros((), dtype=torch.float64), persistent=False)
+            self.register_buffer("diag_cos_zv_sum", torch.zeros((), dtype=torch.float64), persistent=False)
+            self.register_buffer("diag_cos_zv_count", torch.zeros((), dtype=torch.float64), persistent=False)
 
     def _local_simplicial_attention(self, q, k, k2, v, v2):
         assert q.size(1) == k.size(1) == k2.size(1) == v.size(1) == v2.size(1)
@@ -148,9 +184,21 @@ class CausalSelfAttention(nn.Module):
             k2 = norm(k2)
 
         y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if self.collect_attn_stats:
+            y_hat = F.normalize(y.float(), dim=-1, eps=self.attn_stats_eps)
+            v_hat_stats = F.normalize(v.float(), dim=-1, eps=self.attn_stats_eps)
+            cos_yv = (y_hat * v_hat_stats).sum(dim=-1)
+            self.diag_cos_yv_sum += cos_yv.sum().detach().to(torch.float64)
+            self.diag_cos_yv_count += torch.tensor(cos_yv.numel(), device=cos_yv.device, dtype=torch.float64)
         if self.use_xsa:
             v_hat = F.normalize(v, dim=-1, eps=self.xsa_eps)
             y = y - (y * v_hat).sum(dim=-1, keepdim=True) * v_hat
+            if self.collect_attn_stats:
+                z_hat = F.normalize(y.float(), dim=-1, eps=self.attn_stats_eps)
+                v_hat_stats = F.normalize(v.float(), dim=-1, eps=self.attn_stats_eps)
+                cos_zv = (z_hat * v_hat_stats).sum(dim=-1)
+                self.diag_cos_zv_sum += cos_zv.sum().detach().to(torch.float64)
+                self.diag_cos_zv_count += torch.tensor(cos_zv.numel(), device=cos_zv.device, dtype=torch.float64)
         if k2 is not None:
             simplex_y = self._local_simplicial_attention(
                 q.permute(0, 2, 1, 3),
@@ -515,27 +563,31 @@ class MuonAdamW(torch.optim.Optimizer):
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
-SIMPLICIAL_WINDOW = 0   # disabled for XSA-only control
-SIMPLICIAL_SCALE = 0.0
-SIMPLICIAL_LEARNABLE_SCALE = False
-XSA_MODE = "final"      # "off", "final", or "all"
-XSA_EPS = 1e-6
+SIMPLICIAL_WINDOW = env_int("AR_SIMPLICIAL_WINDOW", 0)
+SIMPLICIAL_SCALE = env_float("AR_SIMPLICIAL_SCALE", 0.0)
+SIMPLICIAL_LEARNABLE_SCALE = env_bool("AR_SIMPLICIAL_LEARNABLE_SCALE", False)
+XSA_MODE = env_str("AR_XSA_MODE", "final")      # "off", "final", or "all"
+XSA_EPS = env_float("AR_XSA_EPS", 1e-6)
+COLLECT_ATTN_STATS = env_bool("AR_COLLECT_ATTN_STATS", False)
+ATTN_STATS_EPS = env_float("AR_ATTN_STATS_EPS", 1e-6)
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**18 # ~262K tokens per optimizer step
-EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
-UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
-SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
+TOTAL_BATCH_SIZE = env_int("AR_TOTAL_BATCH_SIZE", 2**18) # ~262K tokens per optimizer step
+EMBEDDING_LR = env_float("AR_EMBEDDING_LR", 0.6)      # learning rate for token embeddings (Adam)
+UNEMBEDDING_LR = env_float("AR_UNEMBEDDING_LR", 0.004)  # learning rate for lm_head (Adam)
+MATRIX_LR = env_float("AR_MATRIX_LR", 0.04)        # learning rate for matrix parameters (Muon)
+SCALAR_LR = env_float("AR_SCALAR_LR", 0.5)         # learning rate for per-layer scalars (Adam)
+WEIGHT_DECAY = env_float("AR_WEIGHT_DECAY", 0.2)      # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
+WARMUP_RATIO = env_float("AR_WARMUP_RATIO", 0.0)      # fraction of time budget for LR warmup
+WARMDOWN_RATIO = env_float("AR_WARMDOWN_RATIO", 0.5)    # fraction of time budget for LR warmdown
+FINAL_LR_FRAC = env_float("AR_FINAL_LR_FRAC", 0.0)     # final LR as fraction of initial
 
 # Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 32   # per-device batch size (reduce if OOM)
+DEPTH = env_int("AR_DEPTH", 8)               # number of transformer layers
+DEVICE_BATCH_SIZE = env_int("AR_DEVICE_BATCH_SIZE", 32)   # per-device batch size (reduce if OOM)
+TRAIN_TIME_BUDGET = env_float("AR_TRAIN_SECONDS", TIME_BUDGET)
+USE_TORCH_COMPILE = env_bool("AR_USE_TORCH_COMPILE", not COLLECT_ATTN_STATS)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -566,6 +618,8 @@ def build_model_config(depth):
         simplicial_learnable_scale=SIMPLICIAL_LEARNABLE_SCALE,
         xsa_mode=XSA_MODE,
         xsa_eps=XSA_EPS,
+        collect_attn_stats=COLLECT_ATTN_STATS,
+        attn_stats_eps=ATTN_STATS_EPS,
     )
 
 config = build_model_config(DEPTH)
@@ -597,12 +651,13 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+if USE_TORCH_COMPILE:
+    model = torch.compile(model, dynamic=False)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
 
-print(f"Time budget: {TIME_BUDGET}s")
+print(f"Time budget: {TRAIN_TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
@@ -644,7 +699,7 @@ while True:
         x, y, epoch = next(train_loader)
 
     # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
+    progress = min(total_training_time / TRAIN_TIME_BUDGET, 1.0)
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(progress)
@@ -677,7 +732,7 @@ while True:
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
     mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
+    remaining = max(0, TRAIN_TIME_BUDGET - total_training_time)
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
@@ -692,7 +747,7 @@ while True:
     step += 1
 
     # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
+    if step > 10 and total_training_time >= TRAIN_TIME_BUDGET:
         break
 
 print()  # newline after \r training log
@@ -720,6 +775,31 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+if COLLECT_ATTN_STATS:
+    global_yv_sum = 0.0
+    global_yv_count = 0.0
+    global_zv_sum = 0.0
+    global_zv_count = 0.0
+    for layer_idx, block in enumerate(model.transformer.h):
+        attn = block.attn
+        if not getattr(attn, "collect_attn_stats", False):
+            continue
+        y_count = float(attn.diag_cos_yv_count.item())
+        z_count = float(attn.diag_cos_zv_count.item())
+        if y_count > 0:
+            y_mean = float(attn.diag_cos_yv_sum.item() / y_count)
+            print(f"attn_cos_yv_layer{layer_idx}: {y_mean:.6f}")
+            global_yv_sum += float(attn.diag_cos_yv_sum.item())
+            global_yv_count += y_count
+        if z_count > 0:
+            z_mean = float(attn.diag_cos_zv_sum.item() / z_count)
+            print(f"attn_cos_zv_layer{layer_idx}: {z_mean:.6f}")
+            global_zv_sum += float(attn.diag_cos_zv_sum.item())
+            global_zv_count += z_count
+    if global_yv_count > 0:
+        print(f"attn_cos_yv_global: {global_yv_sum / global_yv_count:.6f}")
+    if global_zv_count > 0:
+        print(f"attn_cos_zv_global: {global_zv_sum / global_zv_count:.6f}")
 simplicial_gates = [block.attn.simplicial_gate.item() for block in model.transformer.h if block.attn.simplicial_gate is not None]
 if simplicial_gates:
     print(f"simplicial_gates: {', '.join(f'{gate:.4f}' for gate in simplicial_gates)}")

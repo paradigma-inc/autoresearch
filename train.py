@@ -515,9 +515,9 @@ class MuonAdamW(torch.optim.Optimizer):
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
-SIMPLICIAL_WINDOW = 8   # exact ordered triangle window in the final layer only
-SIMPLICIAL_SCALE = 0.02 # small initial gate value for the simplicial path
-SIMPLICIAL_LEARNABLE_SCALE = True
+SIMPLICIAL_WINDOW = 0   # disabled for XSA-only control
+SIMPLICIAL_SCALE = 0.0
+SIMPLICIAL_LEARNABLE_SCALE = False
 XSA_MODE = "final"      # "off", "final", or "all"
 XSA_EPS = 1e-6
 

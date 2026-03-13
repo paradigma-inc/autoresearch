@@ -71,6 +71,13 @@ class GPTConfig:
     xsa_eps: float = 1e-6
     collect_attn_stats: bool = False
     attn_stats_eps: float = 1e-6
+    noble_rank: int = 0
+    noble_mlp_fc: bool = False
+    noble_mlp_proj: bool = False
+    noble_wup_alpha: float = 0.01
+    noble_freq_min: float = 0.8
+    noble_freq_max: float = 1.2
+    noble_phase_std: float = 0.1
 
 
 def norm(x):
@@ -214,16 +221,65 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
+class NobleBranch(nn.Module):
+    def __init__(self, in_dim, out_dim, rank, wup_alpha=0.01, freq_min=0.8, freq_max=1.2, phase_std=0.1):
+        super().__init__()
+        self.rank = rank
+        self.wup_alpha = wup_alpha
+        self.freq_min = freq_min
+        self.freq_max = freq_max
+        self.phase_std = phase_std
+
+        self.w_down = nn.Parameter(torch.empty(rank, in_dim))
+        self.w_up = nn.Parameter(torch.empty(out_dim, rank))
+        self.mix = nn.Parameter(torch.empty(rank, rank))
+        self.omega1 = nn.Parameter(torch.empty(rank))
+        self.phi1 = nn.Parameter(torch.empty(rank))
+        self.omega2 = nn.Parameter(torch.empty(rank))
+        self.phi2 = nn.Parameter(torch.empty(rank))
+
+    def init_weights(self, base_scale):
+        torch.nn.init.uniform_(self.w_down, -base_scale, base_scale)
+        torch.nn.init.normal_(self.w_up, mean=0.0, std=self.wup_alpha / math.sqrt(self.rank))
+        torch.nn.init.xavier_uniform_(self.mix)
+        torch.nn.init.uniform_(self.omega1, self.freq_min, self.freq_max)
+        torch.nn.init.uniform_(self.omega2, self.freq_min, self.freq_max)
+        torch.nn.init.normal_(self.phi1, mean=0.0, std=self.phase_std)
+        torch.nn.init.normal_(self.phi2, mean=0.0, std=self.phase_std)
+
+    def forward(self, x):
+        h = F.linear(x, self.w_down)
+        h = torch.cos(h * self.omega1 + self.phi1)
+        h = F.linear(h, self.mix)
+        h = torch.cos(h * self.omega2 + self.phi2)
+        return F.linear(h, self.w_up)
+
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        noble_kwargs = dict(
+            rank=config.noble_rank,
+            wup_alpha=config.noble_wup_alpha,
+            freq_min=config.noble_freq_min,
+            freq_max=config.noble_freq_max,
+            phase_std=config.noble_phase_std,
+        )
+        self.noble_fc = NobleBranch(config.n_embd, 4 * config.n_embd, **noble_kwargs) if config.noble_mlp_fc else None
+        self.noble_proj = NobleBranch(4 * config.n_embd, config.n_embd, **noble_kwargs) if config.noble_mlp_proj else None
 
     def forward(self, x):
-        x = self.c_fc(x)
+        fc_in = x
+        x = self.c_fc(fc_in)
+        if self.noble_fc is not None:
+            x = x + self.noble_fc(fc_in)
         x = F.relu(x).square()
-        x = self.c_proj(x)
+        proj_in = x
+        x = self.c_proj(proj_in)
+        if self.noble_proj is not None:
+            x = x + self.noble_proj(proj_in)
         return x
 
 
@@ -282,6 +338,10 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.attn.c_proj.weight)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if block.mlp.noble_fc is not None:
+                block.mlp.noble_fc.init_weights(s)
+            if block.mlp.noble_proj is not None:
+                block.mlp.noble_proj.init_weights(s)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
@@ -570,6 +630,13 @@ XSA_MODE = env_str("AR_XSA_MODE", "final")      # "off", "final", or "all"
 XSA_EPS = env_float("AR_XSA_EPS", 1e-6)
 COLLECT_ATTN_STATS = env_bool("AR_COLLECT_ATTN_STATS", False)
 ATTN_STATS_EPS = env_float("AR_ATTN_STATS_EPS", 1e-6)
+NOBLE_RANK = env_int("AR_NOBLE_RANK", 0)  # set >0 to enable NOBLE branches
+NOBLE_MLP_FC = env_bool("AR_NOBLE_MLP_FC", False)
+NOBLE_MLP_PROJ = env_bool("AR_NOBLE_MLP_PROJ", False)
+NOBLE_WUP_ALPHA = env_float("AR_NOBLE_WUP_ALPHA", 0.01)
+NOBLE_FREQ_MIN = env_float("AR_NOBLE_FREQ_MIN", 0.8)
+NOBLE_FREQ_MAX = env_float("AR_NOBLE_FREQ_MAX", 1.2)
+NOBLE_PHASE_STD = env_float("AR_NOBLE_PHASE_STD", 0.1)
 
 # Optimization
 TOTAL_BATCH_SIZE = env_int("AR_TOTAL_BATCH_SIZE", 2**18) # ~262K tokens per optimizer step
@@ -626,6 +693,13 @@ def build_model_config(depth):
         xsa_eps=XSA_EPS,
         collect_attn_stats=COLLECT_ATTN_STATS,
         attn_stats_eps=ATTN_STATS_EPS,
+        noble_rank=NOBLE_RANK,
+        noble_mlp_fc=NOBLE_MLP_FC,
+        noble_mlp_proj=NOBLE_MLP_PROJ,
+        noble_wup_alpha=NOBLE_WUP_ALPHA,
+        noble_freq_min=NOBLE_FREQ_MIN,
+        noble_freq_max=NOBLE_FREQ_MAX,
+        noble_phase_std=NOBLE_PHASE_STD,
     )
 
 config = build_model_config(DEPTH)
@@ -826,6 +900,14 @@ if COLLECT_ATTN_STATS:
         print(f"attn_cos_yv_global: {global_yv_sum / global_yv_count:.6f}")
     if global_zv_count > 0:
         print(f"attn_cos_zv_global: {global_zv_sum / global_zv_count:.6f}")
+if config.noble_rank > 0:
+    noble_targets = []
+    if config.noble_mlp_fc:
+        noble_targets.append("mlp_fc")
+    if config.noble_mlp_proj:
+        noble_targets.append("mlp_proj")
+    print(f"noble_rank:       {config.noble_rank}")
+    print(f"noble_targets:    {', '.join(noble_targets)}")
 simplicial_gates = [block.attn.simplicial_gate.item() for block in model.transformer.h if block.attn.simplicial_gate is not None]
 if simplicial_gates:
     print(f"simplicial_gates: {', '.join(f'{gate:.4f}' for gate in simplicial_gates)}")

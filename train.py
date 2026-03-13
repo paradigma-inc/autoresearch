@@ -632,8 +632,8 @@ SIMPLICIAL_LEARNABLE_SCALE = False
 XSA_MODE = "off"        # "off", "final", or "all"
 XSA_EPS = 1e-6
 NOBLE_RANK = 32         # bottleneck rank for CosNet low-rank branches
-NOBLE_MLP_FC = True     # add a NOBLE branch to the MLP expansion linear
-NOBLE_MLP_PROJ = False  # keep the first placement-scope follow-up on c_fc only
+NOBLE_MLP_FC = False    # rule out expansion-only placement after Attempt 007
+NOBLE_MLP_PROJ = True   # test whether the useful signal lives in the projection linear
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**18 # ~262K tokens per optimizer step

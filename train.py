@@ -460,14 +460,14 @@ class GPT(nn.Module):
             ))
         if noble_scalar_params:
             param_groups.append(dict(
-                kind='adamw', params=noble_scalar_params, lr=scalar_lr * 0.1,
+                kind='adamw_plain', params=noble_scalar_params, lr=scalar_lr * 0.1,
                 betas=adam_betas, eps=1e-10, weight_decay=0.0,
             ))
         if noble_matrix_params:
             # The low-rank branch introduces several tiny matrix shapes; keeping them out of
             # the compiled Muon path avoids recompile churn while preserving Muon for the main model.
             param_groups.append(dict(
-                kind='adamw', params=noble_matrix_params, lr=matrix_lr * 0.25,
+                kind='adamw_plain', params=noble_matrix_params, lr=matrix_lr * 0.25,
                 betas=adam_betas, eps=1e-10, weight_decay=0.0,
             ))
         for shape in sorted({p.shape for p in matrix_params}):
@@ -607,6 +607,29 @@ class MuonAdamW(torch.optim.Optimizer):
                             self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
                             self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
 
+    def _step_adamw_plain(self, group):
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            grad = p.grad
+            state = self.state[p]
+            if not state:
+                state['step'] = 0
+                state['exp_avg'] = torch.zeros_like(p)
+                state['exp_avg_sq'] = torch.zeros_like(p)
+            state['step'] += 1
+            beta1, beta2 = group['betas']
+            exp_avg = state['exp_avg']
+            exp_avg_sq = state['exp_avg_sq']
+            p.mul_(1 - group['lr'] * group['weight_decay'])
+            exp_avg.lerp_(grad, 1 - beta1)
+            exp_avg_sq.lerp_(grad.square(), 1 - beta2)
+            bias1 = 1 - beta1 ** state['step']
+            bias2 = 1 - beta2 ** state['step']
+            denom = (exp_avg_sq / bias2).sqrt() + group['eps']
+            step_size = group['lr'] / bias1
+            p.add_(exp_avg / denom, alpha=-step_size)
+
     def _step_muon(self, group):
         params = group['params']
         if not params:
@@ -638,6 +661,8 @@ class MuonAdamW(torch.optim.Optimizer):
         for group in self.param_groups:
             if group['kind'] == 'adamw':
                 self._step_adamw(group)
+            elif group['kind'] == 'adamw_plain':
+                self._step_adamw_plain(group)
             elif group['kind'] == 'muon':
                 self._step_muon(group)
 

@@ -23,7 +23,7 @@ cap = torch.cuda.get_device_capability()
 repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
 fa3 = get_kernel(repo).flash_attn_interface
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+from prepare import EVAL_TOKENS, MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, get_token_bytes, make_dataloader
 
 # ---------------------------------------------------------------------------
 # Environment helpers
@@ -588,6 +588,12 @@ DEPTH = env_int("AR_DEPTH", 8)               # number of transformer layers
 DEVICE_BATCH_SIZE = env_int("AR_DEVICE_BATCH_SIZE", 32)   # per-device batch size (reduce if OOM)
 TRAIN_TIME_BUDGET = env_float("AR_TRAIN_SECONDS", TIME_BUDGET)
 USE_TORCH_COMPILE = env_bool("AR_USE_TORCH_COMPILE", not COLLECT_ATTN_STATS)
+SEQUENCE_LEN = env_int("AR_SEQUENCE_LEN", MAX_SEQ_LEN)
+EVAL_SEQUENCE_LEN = env_int("AR_EVAL_SEQUENCE_LEN", SEQUENCE_LEN)
+if not 1 <= SEQUENCE_LEN <= MAX_SEQ_LEN:
+    raise ValueError(f"AR_SEQUENCE_LEN must be in [1, {MAX_SEQ_LEN}], got {SEQUENCE_LEN}")
+if not 1 <= EVAL_SEQUENCE_LEN <= MAX_SEQ_LEN:
+    raise ValueError(f"AR_EVAL_SEQUENCE_LEN must be in [1, {MAX_SEQ_LEN}], got {EVAL_SEQUENCE_LEN}")
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -610,7 +616,7 @@ def build_model_config(depth):
     model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
     num_heads = model_dim // HEAD_DIM
     return GPTConfig(
-        sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
+        sequence_len=SEQUENCE_LEN, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
         simplicial_window=SIMPLICIAL_WINDOW,
@@ -638,7 +644,7 @@ num_params = param_counts['total']
 num_flops_per_token = model.estimate_flops()
 print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
+tokens_per_fwdbwd = DEVICE_BATCH_SIZE * SEQUENCE_LEN
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
@@ -654,7 +660,7 @@ optimizer = model.setup_optimizer(
 if USE_TORCH_COMPILE:
     model = torch.compile(model, dynamic=False)
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, SEQUENCE_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TRAIN_TIME_BUDGET}s")
@@ -677,6 +683,24 @@ def get_muon_momentum(step):
 
 def get_weight_decay(progress):
     return WEIGHT_DECAY * (1 - progress)
+
+
+@torch.no_grad()
+def evaluate_bpb_at_seq(model, tokenizer, batch_size, sequence_len):
+    token_bytes = get_token_bytes(device="cuda")
+    val_loader = make_dataloader(tokenizer, batch_size, sequence_len, "val")
+    steps = max(1, EVAL_TOKENS // (batch_size * sequence_len))
+    total_nats = 0.0
+    total_bytes = 0
+    for _ in range(steps):
+        x_eval, y_eval, _ = next(val_loader)
+        loss_flat = model(x_eval, y_eval, reduction='none').view(-1)
+        y_flat = y_eval.view(-1)
+        nbytes = token_bytes[y_flat]
+        mask = nbytes > 0
+        total_nats += (loss_flat * mask).sum().item()
+        total_bytes += nbytes.sum().item()
+    return total_nats / (math.log(2) * total_bytes)
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -757,7 +781,7 @@ total_tokens = step * TOTAL_BATCH_SIZE
 # Final eval
 model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    val_bpb = evaluate_bpb_at_seq(model, tokenizer, DEVICE_BATCH_SIZE, EVAL_SEQUENCE_LEN)
 
 # Final summary
 t_end = time.time()
@@ -775,6 +799,8 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+print(f"sequence_len:     {SEQUENCE_LEN}")
+print(f"eval_sequence_len:{EVAL_SEQUENCE_LEN}")
 if COLLECT_ATTN_STATS:
     global_yv_sum = 0.0
     global_yv_count = 0.0

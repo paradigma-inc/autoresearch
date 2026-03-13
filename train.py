@@ -78,6 +78,7 @@ class GPTConfig:
     noble_freq_min: float = 0.8
     noble_freq_max: float = 1.2
     noble_phase_std: float = 0.1
+    noble_activation: str = "cos_net"
 
 
 def norm(x):
@@ -222,36 +223,70 @@ class CausalSelfAttention(nn.Module):
 
 
 class NobleBranch(nn.Module):
-    def __init__(self, in_dim, out_dim, rank, wup_alpha=0.01, freq_min=0.8, freq_max=1.2, phase_std=0.1):
+    def __init__(
+        self,
+        in_dim,
+        out_dim,
+        rank,
+        wup_alpha=0.01,
+        freq_min=0.8,
+        freq_max=1.2,
+        phase_std=0.1,
+        activation="cos_net",
+    ):
         super().__init__()
         self.rank = rank
         self.wup_alpha = wup_alpha
         self.freq_min = freq_min
         self.freq_max = freq_max
         self.phase_std = phase_std
+        self.activation = activation.lower()
 
         self.w_down = nn.Parameter(torch.empty(rank, in_dim))
         self.w_up = nn.Parameter(torch.empty(out_dim, rank))
         self.mix = nn.Parameter(torch.empty(rank, rank))
-        self.omega1 = nn.Parameter(torch.empty(rank))
-        self.phi1 = nn.Parameter(torch.empty(rank))
-        self.omega2 = nn.Parameter(torch.empty(rank))
-        self.phi2 = nn.Parameter(torch.empty(rank))
+        if self.activation == "cos_net":
+            self.omega1 = nn.Parameter(torch.empty(rank))
+            self.phi1 = nn.Parameter(torch.empty(rank))
+            self.omega2 = nn.Parameter(torch.empty(rank))
+            self.phi2 = nn.Parameter(torch.empty(rank))
+        else:
+            self.register_parameter("omega1", None)
+            self.register_parameter("phi1", None)
+            self.register_parameter("omega2", None)
+            self.register_parameter("phi2", None)
 
     def init_weights(self, base_scale):
         torch.nn.init.uniform_(self.w_down, -base_scale, base_scale)
         torch.nn.init.normal_(self.w_up, mean=0.0, std=self.wup_alpha / math.sqrt(self.rank))
         torch.nn.init.xavier_uniform_(self.mix)
-        torch.nn.init.uniform_(self.omega1, self.freq_min, self.freq_max)
-        torch.nn.init.uniform_(self.omega2, self.freq_min, self.freq_max)
-        torch.nn.init.normal_(self.phi1, mean=0.0, std=self.phase_std)
-        torch.nn.init.normal_(self.phi2, mean=0.0, std=self.phase_std)
+        if self.activation == "cos_net":
+            torch.nn.init.uniform_(self.omega1, self.freq_min, self.freq_max)
+            torch.nn.init.uniform_(self.omega2, self.freq_min, self.freq_max)
+            torch.nn.init.normal_(self.phi1, mean=0.0, std=self.phase_std)
+            torch.nn.init.normal_(self.phi2, mean=0.0, std=self.phase_std)
+
+    def _apply_activation(self, h):
+        if self.activation == "cos_net":
+            return torch.cos(h * self.omega1 + self.phi1)
+        if self.activation == "gelu_net":
+            return F.gelu(h)
+        if self.activation == "silu_net":
+            return F.silu(h)
+        if self.activation == "tanh_net":
+            return torch.tanh(h)
+        if self.activation == "identity":
+            return h
+        raise ValueError(f"Unsupported NOBLE activation: {self.activation}")
 
     def forward(self, x):
         h = F.linear(x, self.w_down)
-        h = torch.cos(h * self.omega1 + self.phi1)
+        h = self._apply_activation(h)
         h = F.linear(h, self.mix)
-        h = torch.cos(h * self.omega2 + self.phi2)
+        if self.activation == "cos_net":
+            h = torch.cos(h * self.omega2 + self.phi2)
+        else:
+            h = self._apply_activation(h)
         return F.linear(h, self.w_up)
 
 
@@ -266,6 +301,7 @@ class MLP(nn.Module):
             freq_min=config.noble_freq_min,
             freq_max=config.noble_freq_max,
             phase_std=config.noble_phase_std,
+            activation=config.noble_activation,
         )
         self.noble_fc = NobleBranch(config.n_embd, 4 * config.n_embd, **noble_kwargs) if config.noble_mlp_fc else None
         self.noble_proj = NobleBranch(4 * config.n_embd, config.n_embd, **noble_kwargs) if config.noble_mlp_proj else None
@@ -688,6 +724,7 @@ NOBLE_WUP_ALPHA = env_float("AR_NOBLE_WUP_ALPHA", 0.01)
 NOBLE_FREQ_MIN = env_float("AR_NOBLE_FREQ_MIN", 0.8)
 NOBLE_FREQ_MAX = env_float("AR_NOBLE_FREQ_MAX", 1.2)
 NOBLE_PHASE_STD = env_float("AR_NOBLE_PHASE_STD", 0.1)
+NOBLE_ACT = env_str("AR_NOBLE_ACT", "cos_net")
 
 # Optimization
 TOTAL_BATCH_SIZE = env_int("AR_TOTAL_BATCH_SIZE", 2**18) # ~262K tokens per optimizer step
@@ -751,6 +788,7 @@ def build_model_config(depth):
         noble_freq_min=NOBLE_FREQ_MIN,
         noble_freq_max=NOBLE_FREQ_MAX,
         noble_phase_std=NOBLE_PHASE_STD,
+        noble_activation=NOBLE_ACT,
     )
 
 config = build_model_config(DEPTH)
@@ -958,6 +996,7 @@ if config.noble_rank > 0:
     if config.noble_mlp_proj:
         noble_targets.append("mlp_proj")
     print(f"noble_rank:       {config.noble_rank}")
+    print(f"noble_activation: {config.noble_activation}")
     print(f"noble_targets:    {', '.join(noble_targets)}")
 simplicial_gates = [block.attn.simplicial_gate.item() for block in model.transformer.h if block.attn.simplicial_gate is not None]
 if simplicial_gates:

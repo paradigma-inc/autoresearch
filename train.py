@@ -41,6 +41,8 @@ class GPTConfig:
     simplicial_window: int = 0
     simplicial_scale: float = 0.0
     simplicial_learnable_scale: bool = False
+    xsa_mode: str = "off"
+    xsa_eps: float = 1e-6
 
 
 def norm(x):
@@ -78,6 +80,11 @@ class CausalSelfAttention(nn.Module):
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        xsa_mode = config.xsa_mode.lower()
+        if xsa_mode not in {"off", "all", "final"}:
+            raise ValueError(f"Unsupported XSA mode: {config.xsa_mode}")
+        self.use_xsa = xsa_mode == "all" or (xsa_mode == "final" and layer_idx == config.n_layer - 1)
+        self.xsa_eps = config.xsa_eps
         self.simplex_window = config.simplicial_window if has_simplicial(layer_idx, config.n_layer) else 0
         self.simplicial_scale = config.simplicial_scale
         self.simplicial_gate = (
@@ -141,6 +148,9 @@ class CausalSelfAttention(nn.Module):
             k2 = norm(k2)
 
         y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if self.use_xsa:
+            v_hat = F.normalize(v, dim=-1, eps=self.xsa_eps)
+            y = y - (y * v_hat).sum(dim=-1, keepdim=True) * v_hat
         if k2 is not None:
             simplex_y = self._local_simplicial_attention(
                 q.permute(0, 2, 1, 3),
@@ -508,6 +518,8 @@ WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 SIMPLICIAL_WINDOW = 8   # exact ordered triangle window in the final layer only
 SIMPLICIAL_SCALE = 0.02 # small initial gate value for the simplicial path
 SIMPLICIAL_LEARNABLE_SCALE = True
+XSA_MODE = "final"      # "off", "final", or "all"
+XSA_EPS = 1e-6
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**18 # ~262K tokens per optimizer step
@@ -552,6 +564,8 @@ def build_model_config(depth):
         simplicial_window=SIMPLICIAL_WINDOW,
         simplicial_scale=SIMPLICIAL_SCALE,
         simplicial_learnable_scale=SIMPLICIAL_LEARNABLE_SCALE,
+        xsa_mode=XSA_MODE,
+        xsa_eps=XSA_EPS,
     )
 
 config = build_model_config(DEPTH)

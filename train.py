@@ -725,6 +725,13 @@ NOBLE_FREQ_MIN = env_float("AR_NOBLE_FREQ_MIN", 0.8)
 NOBLE_FREQ_MAX = env_float("AR_NOBLE_FREQ_MAX", 1.2)
 NOBLE_PHASE_STD = env_float("AR_NOBLE_PHASE_STD", 0.1)
 NOBLE_ACT = env_str("AR_NOBLE_ACT", "cos_net")
+OBJECTIVE = env_str("AR_OBJECTIVE", "causal").lower()  # "causal" or "mlm"
+MLM_MASK_PROB = env_float("AR_MLM_MASK_PROB", 0.15)
+MLM_MASK_TOKEN = env_int("AR_MLM_MASK_TOKEN", 0)
+if OBJECTIVE not in {"causal", "mlm"}:
+    raise ValueError(f"AR_OBJECTIVE must be 'causal' or 'mlm', got {OBJECTIVE}")
+if not 0.0 < MLM_MASK_PROB < 1.0:
+    raise ValueError(f"AR_MLM_MASK_PROB must be in (0, 1), got {MLM_MASK_PROB}")
 
 # Optimization
 TOTAL_BATCH_SIZE = env_int("AR_TOTAL_BATCH_SIZE", 2**18) # ~262K tokens per optimizer step
@@ -828,6 +835,7 @@ x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TRAIN_TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
+print(f"Objective: {OBJECTIVE}")
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 
@@ -865,6 +873,33 @@ def evaluate_bpb_at_seq(model, tokenizer, batch_size, sequence_len):
         total_bytes += nbytes.sum().item()
     return total_nats / (math.log(2) * total_bytes)
 
+
+def make_mlm_batch(x_in, mask_prob, mask_token):
+    x_masked = x_in.clone()
+    y_masked = x_in.clone()
+    mask = torch.rand(x_in.shape, device=x_in.device) < mask_prob
+    if not mask.any():
+        mask[0, 0] = True
+    y_masked[~mask] = -1
+    x_masked[mask] = mask_token
+    return x_masked, y_masked
+
+
+@torch.no_grad()
+def evaluate_mlm_bpb_at_seq(model, tokenizer, batch_size, sequence_len, mask_prob, mask_token):
+    val_loader = make_dataloader(tokenizer, batch_size, sequence_len, "val")
+    steps = max(1, EVAL_TOKENS // (batch_size * sequence_len))
+    total_nats = 0.0
+    total_masked = 0
+    for _ in range(steps):
+        x_eval, _, _ = next(val_loader)
+        x_mlm, y_mlm = make_mlm_batch(x_eval, mask_prob, mask_token)
+        loss_flat = model(x_mlm, y_mlm, reduction='none').view(-1)
+        mask_flat = y_mlm.view(-1) != -1
+        total_nats += loss_flat[mask_flat].sum().item()
+        total_masked += int(mask_flat.sum().item())
+    return total_nats / (math.log(2) * max(total_masked, 1))
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -878,8 +913,12 @@ while True:
     torch.cuda.synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
+        x_batch = x
+        y_batch = y
+        if OBJECTIVE == "mlm":
+            x_batch, y_batch = make_mlm_batch(x_batch, MLM_MASK_PROB, MLM_MASK_TOKEN)
         with autocast_ctx:
-            loss = model(x, y)
+            loss = model(x_batch, y_batch)
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
@@ -944,7 +983,12 @@ total_tokens = step * TOTAL_BATCH_SIZE
 # Final eval
 model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb_at_seq(model, tokenizer, DEVICE_BATCH_SIZE, EVAL_SEQUENCE_LEN)
+    if OBJECTIVE == "causal":
+        val_bpb = evaluate_bpb_at_seq(model, tokenizer, DEVICE_BATCH_SIZE, EVAL_SEQUENCE_LEN)
+    else:
+        val_bpb = evaluate_mlm_bpb_at_seq(
+            model, tokenizer, DEVICE_BATCH_SIZE, EVAL_SEQUENCE_LEN, MLM_MASK_PROB, MLM_MASK_TOKEN
+        )
 
 # Final summary
 t_end = time.time()
@@ -964,6 +1008,10 @@ print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
 print(f"sequence_len:     {SEQUENCE_LEN}")
 print(f"eval_sequence_len:{EVAL_SEQUENCE_LEN}")
+print(f"objective:        {OBJECTIVE}")
+if OBJECTIVE == "mlm":
+    print(f"mlm_mask_prob:    {MLM_MASK_PROB:.3f}")
+    print(f"mlm_mask_token:   {MLM_MASK_TOKEN}")
 if COLLECT_ATTN_STATS:
     global_yv_sum = 0.0
     global_yv_count = 0.0

@@ -446,6 +446,12 @@ WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.125   # probe whether pushing above the 10% winner still helps
 WEIGHT_DECAY_TAPER_START = 0.85 # preserve the winning early regime, then taper WD to zero late
+MUON_RELEASE_START = 0.72 # shorten Muon memory only in the last third
+MUON_FINAL_MOMENTUM = 0.88
+MUON_BETA2_RELEASE_START = 0.70
+MUON_FINAL_BETA2 = 0.88
+ADAM_BETA2_RELEASE_START = 0.70
+ADAM_FINAL_BETA2 = 0.90
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -525,9 +531,25 @@ def get_lr_multiplier(progress):
         cooldown = (1.0 - progress) / WARMDOWN_RATIO
         return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
 
-def get_muon_momentum(step):
+def get_muon_momentum(step, progress):
     frac = min(step / 300, 1)
-    return (1 - frac) * 0.85 + frac * 0.95
+    base_momentum = (1 - frac) * 0.85 + frac * 0.95
+    if progress < MUON_RELEASE_START:
+        return base_momentum
+    tail_progress = (progress - MUON_RELEASE_START) / (1.0 - MUON_RELEASE_START)
+    return base_momentum * (1.0 - tail_progress) + MUON_FINAL_MOMENTUM * tail_progress
+
+def get_muon_beta2(progress):
+    if progress < MUON_BETA2_RELEASE_START:
+        return 0.95
+    tail_progress = (progress - MUON_BETA2_RELEASE_START) / (1.0 - MUON_BETA2_RELEASE_START)
+    return 0.95 * (1.0 - tail_progress) + MUON_FINAL_BETA2 * tail_progress
+
+def get_adam_beta2(progress):
+    if progress < ADAM_BETA2_RELEASE_START:
+        return ADAM_BETAS[1]
+    tail_progress = (progress - ADAM_BETA2_RELEASE_START) / (1.0 - ADAM_BETA2_RELEASE_START)
+    return ADAM_BETAS[1] * (1.0 - tail_progress) + ADAM_FINAL_BETA2 * tail_progress
 
 def get_weight_decay(progress):
     if progress < WEIGHT_DECAY_TAPER_START:
@@ -558,13 +580,18 @@ while True:
     # Progress and schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
     lrm = get_lr_multiplier(progress)
-    muon_momentum = get_muon_momentum(step)
+    muon_momentum = get_muon_momentum(step, progress)
+    muon_beta2 = get_muon_beta2(progress)
+    adam_beta2 = get_adam_beta2(progress)
     muon_weight_decay = get_weight_decay(progress)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
+            group["beta2"] = muon_beta2
             group["weight_decay"] = muon_weight_decay
+        else:
+            group["betas"] = (group["betas"][0], adam_beta2)
     optimizer.step()
     model.zero_grad(set_to_none=True)
 

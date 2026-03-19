@@ -445,6 +445,10 @@ ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.125   # probe whether pushing above the 10% winner still helps
+REHEAT_START = 0.82     # briefly re-accelerate late instead of only cooling
+REHEAT_END = 0.97
+REHEAT_LR_BUMP = 0.10
+REHEAT_MOMENTUM_DROP = 0.08
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -517,16 +521,24 @@ print(f"Gradient accumulation steps: {grad_accum_steps}")
 
 def get_lr_multiplier(progress):
     if progress < WARMUP_RATIO:
-        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
+        base = progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
     elif progress < 1.0 - WARMDOWN_RATIO:
-        return 1.0
+        base = 1.0
     else:
         cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
+        base = cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
+    if REHEAT_START <= progress <= REHEAT_END:
+        reheat_phase = (progress - REHEAT_START) / (REHEAT_END - REHEAT_START)
+        base += REHEAT_LR_BUMP * math.sin(math.pi * reheat_phase)
+    return base
 
-def get_muon_momentum(step):
+def get_muon_momentum(step, progress):
     frac = min(step / 300, 1)
-    return (1 - frac) * 0.85 + frac * 0.95
+    base_momentum = (1 - frac) * 0.85 + frac * 0.95
+    if REHEAT_START <= progress <= REHEAT_END:
+        reheat_phase = (progress - REHEAT_START) / (REHEAT_END - REHEAT_START)
+        base_momentum -= REHEAT_MOMENTUM_DROP * math.sin(math.pi * reheat_phase)
+    return base_momentum
 
 def get_weight_decay(progress):
     return WEIGHT_DECAY * (1 - progress)
@@ -554,7 +566,7 @@ while True:
     # Progress and schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
     lrm = get_lr_multiplier(progress)
-    muon_momentum = get_muon_momentum(step)
+    muon_momentum = get_muon_momentum(step, progress)
     muon_weight_decay = get_weight_decay(progress)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm

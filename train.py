@@ -257,8 +257,10 @@ class GPT(nn.Module):
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+                kind='matrix_mix', params=group_params, lr=matrix_lr,
+                betas=adam_betas, eps=1e-10, momentum=0.95, ns_steps=5,
+                beta2=0.95, weight_decay=weight_decay,
+                muon_start=MUON_TAIL_START, muon_full=MUON_TAIL_FULL,
             ))
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
@@ -302,6 +304,9 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
+MUON_TAIL_START = 0.70
+MUON_TAIL_FULL = 0.95
+
 @torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
@@ -335,7 +340,7 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
             X = a * X + B @ X
     g = X
     # NorMuon variance reduction
-    beta2 = beta2_t.to(g.dtype)
+    beta2 = float(beta2_t)
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
@@ -347,10 +352,47 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
     g = g * final_scale.to(g.dtype)
     # Cautious weight decay + parameter update
-    lr = lr_t.to(g.dtype)
-    wd = wd_t.to(g.dtype)
+    lr = float(lr_t)
+    wd = float(wd_t)
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+
+@torch.compile(dynamic=False, fullgraph=True)
+def matrix_mix_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
+                          momentum_t, lr_t, wd_t, beta2_t, mix_alpha_t, ns_steps, red_dim):
+    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
+    X = g.bfloat16()
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
+    if g.size(-2) > g.size(-1):
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = X.mT @ X
+            B = b * A + c * (A @ A)
+            X = a * X + X @ B
+    else:
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = X @ X.mT
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+    mu = X
+    alpha = mix_alpha_t.to(mu.dtype)
+    mixed = g.to(mu.dtype).lerp(mu, alpha)
+    beta2 = float(beta2_t)
+    v_mean = mixed.float().square().mean(dim=red_dim, keepdim=True)
+    red_dim_size = mixed.size(red_dim)
+    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
+    v_norm = v_norm_sq.sqrt()
+    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
+    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
+    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+    mixed = mixed * final_scale.to(mixed.dtype)
+    lr = float(lr_t)
+    wd = float(wd_t)
+    mask = (mixed * stacked_params) >= 0
+    stacked_params.sub_(lr * mixed + lr * wd * stacked_params * mask)
 
 
 class MuonAdamW(torch.optim.Optimizer):
@@ -369,6 +411,7 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_mix_alpha_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
     def _step_adamw(self, group):
         for p in group['params']:
@@ -417,6 +460,41 @@ class MuonAdamW(torch.optim.Optimizer):
                         self._muon_beta2_t, group["ns_steps"], red_dim)
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
+    def _step_matrix_mix(self, group):
+        progress = float(group.get("progress", 0.0))
+        muon_start = float(group.get("muon_start", MUON_TAIL_START))
+        muon_full = float(group.get("muon_full", MUON_TAIL_FULL))
+        if progress <= muon_start:
+            self._step_adamw(group)
+            return
+        params = group['params']
+        if not params:
+            return
+        p = params[0]
+        state = self.state[p]
+        num_params = len(params)
+        shape, device, dtype = p.shape, p.device, p.dtype
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
+        if "second_momentum_buffer" not in state:
+            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
+            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
+        red_dim = -1 if shape[-2] >= shape[-1] else -2
+        mix_alpha = min(max((progress - muon_start) / max(muon_full - muon_start, 1e-6), 0.0), 1.0)
+        stacked_grads = torch.stack([p.grad for p in params])
+        stacked_params = torch.stack(params)
+        self._muon_momentum_t.fill_(group["momentum"])
+        self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
+        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+        self._muon_wd_t.fill_(group["weight_decay"])
+        self._muon_mix_alpha_t.fill_(mix_alpha)
+        matrix_mix_step_fused(stacked_grads, stacked_params,
+                              state["momentum_buffer"], state["second_momentum_buffer"],
+                              self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
+                              self._muon_beta2_t, self._muon_mix_alpha_t,
+                              group["ns_steps"], red_dim)
+        torch._foreach_copy_(params, list(stacked_params.unbind(0)))
+
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
@@ -424,6 +502,8 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._step_adamw(group)
             elif group['kind'] == 'muon':
                 self._step_muon(group)
+            elif group['kind'] == 'matrix_mix':
+                self._step_matrix_mix(group)
 
 # ---------------------------------------------------------------------------
 # Hyperparameters (edit these directly, no CLI flags needed)
@@ -435,7 +515,7 @@ HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**18 # ~262K tokens per optimizer step
+TOTAL_BATCH_SIZE = 196608 # moderate batch line: more optimizer steps in 5 minutes
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
@@ -444,7 +524,7 @@ WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
+FINAL_LR_FRAC = 0.05    # stay on the 5% LR-floor line while tempering matrix geometry
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -558,9 +638,11 @@ while True:
     muon_weight_decay = get_weight_decay(progress)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
+        if group['kind'] in {'muon', 'matrix_mix'}:
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
+        if group['kind'] == 'matrix_mix':
+            group["progress"] = progress
     optimizer.step()
     model.zero_grad(set_to_none=True)
 

@@ -445,6 +445,7 @@ ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.125   # probe whether pushing above the 10% winner still helps
+WEIGHT_DECAY_TAPER_START = 0.85 # preserve the winning early regime, then taper WD to zero late
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -529,7 +530,10 @@ def get_muon_momentum(step):
     return (1 - frac) * 0.85 + frac * 0.95
 
 def get_weight_decay(progress):
-    return WEIGHT_DECAY * (1 - progress)
+    if progress < WEIGHT_DECAY_TAPER_START:
+        return WEIGHT_DECAY
+    taper_progress = (progress - WEIGHT_DECAY_TAPER_START) / (1.0 - WEIGHT_DECAY_TAPER_START)
+    return WEIGHT_DECAY * (1.0 - taper_progress)
 
 # ---------------------------------------------------------------------------
 # Training loop

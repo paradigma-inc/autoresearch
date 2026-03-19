@@ -579,6 +579,7 @@ while True:
 
     # Progress and schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
+    report_lrm = get_group_lr_multiplier('muon', progress)
     muon_momentum = get_muon_momentum(step, progress)
     muon_beta2 = get_muon_beta2(progress)
     muon_weight_decay = get_weight_decay(progress)
@@ -614,7 +615,7 @@ while True:
     mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {report_lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:

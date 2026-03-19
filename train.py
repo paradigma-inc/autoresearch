@@ -257,8 +257,9 @@ class GPT(nn.Module):
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+                kind='matrix_mix', params=group_params, lr=matrix_lr,
+                betas=adam_betas, eps=1e-10, momentum=0.95, ns_steps=5,
+                beta2=0.95, weight_decay=weight_decay, muon_mix=0.0,
             ))
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
@@ -301,6 +302,9 @@ polar_express_coeffs = [
     (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
+
+MUON_MIX_START = 0.55
+MUON_MIX_RAMP = 0.35
 
 @torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
@@ -417,6 +421,69 @@ class MuonAdamW(torch.optim.Optimizer):
                         self._muon_beta2_t, group["ns_steps"], red_dim)
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
+    def _step_matrix_mix(self, group):
+        mix = float(group.get("muon_mix", 0.0))
+        if mix <= 0.0:
+            self._step_adamw(group)
+            return
+        if mix >= 1.0:
+            self._step_muon(group)
+            return
+
+        params = group["params"]
+        if not params:
+            return
+
+        adamw_candidates = []
+        for p in params:
+            if p.grad is None:
+                adamw_candidates.append(p.detach().clone())
+                continue
+            grad = p.grad
+            state = self.state[p]
+            if not state:
+                state["step"] = 0
+                state["exp_avg"] = torch.zeros_like(p)
+                state["exp_avg_sq"] = torch.zeros_like(p)
+            adamw_p = p.detach().clone()
+            state["step"] += 1
+            self._adamw_step_t.fill_(state["step"])
+            self._adamw_lr_t.fill_(group["lr"])
+            self._adamw_beta1_t.fill_(group["betas"][0])
+            self._adamw_beta2_t.fill_(group["betas"][1])
+            self._adamw_eps_t.fill_(group["eps"])
+            self._adamw_wd_t.fill_(group["weight_decay"])
+            adamw_step_fused(
+                adamw_p, grad, state["exp_avg"], state["exp_avg_sq"],
+                self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
+                self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
+            )
+            adamw_candidates.append(adamw_p)
+
+        p0 = params[0]
+        state = self.state[p0]
+        num_params = len(params)
+        shape, device, dtype = p0.shape, p0.device, p0.dtype
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
+        if "second_momentum_buffer" not in state:
+            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
+            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
+        red_dim = -1 if shape[-2] >= shape[-1] else -2
+        stacked_grads = torch.stack([p.grad for p in params])
+        muon_params = torch.stack([p.detach().clone() for p in params])
+        self._muon_momentum_t.fill_(group["momentum"])
+        self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
+        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+        self._muon_wd_t.fill_(group["weight_decay"])
+        muon_step_fused(
+            stacked_grads, muon_params, state["momentum_buffer"], state["second_momentum_buffer"],
+            self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
+            self._muon_beta2_t, group["ns_steps"], red_dim,
+        )
+        blended = torch.stack(adamw_candidates).lerp_(muon_params, mix)
+        torch._foreach_copy_(params, list(blended.unbind(0)))
+
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
@@ -424,6 +491,8 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._step_adamw(group)
             elif group['kind'] == 'muon':
                 self._step_muon(group)
+            elif group['kind'] == 'matrix_mix':
+                self._step_matrix_mix(group)
 
 # ---------------------------------------------------------------------------
 # Hyperparameters (edit these directly, no CLI flags needed)
@@ -444,7 +513,7 @@ WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
+FINAL_LR_FRAC = 0.05    # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -531,6 +600,14 @@ def get_muon_momentum(step):
 def get_weight_decay(progress):
     return WEIGHT_DECAY * (1 - progress)
 
+def get_muon_mix(progress):
+    if progress <= MUON_MIX_START:
+        return 0.0
+    if progress >= MUON_MIX_START + MUON_MIX_RAMP:
+        return 1.0
+    x = (progress - MUON_MIX_START) / MUON_MIX_RAMP
+    return x * x * (3 - 2 * x)
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -556,11 +633,14 @@ while True:
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(progress)
+    muon_mix = get_muon_mix(progress)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
+        if group['kind'] in {'muon', 'matrix_mix'}:
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
+        if group["kind"] == 'matrix_mix':
+            group["muon_mix"] = muon_mix
     optimizer.step()
     model.zero_grad(set_to_none=True)
 

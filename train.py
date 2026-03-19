@@ -340,20 +340,21 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
             X = a * X + B @ X
     g = X
     # NorMuon variance reduction
-    beta2 = float(beta2_t)
+    beta2 = beta2_t.to(device=second_momentum_buffer.device, dtype=second_momentum_buffer.dtype)
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
     v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    target = v_mean.to(dtype=second_momentum_buffer.dtype)
+    second_momentum_buffer.mul_(beta2).add_(target * (1 - beta2))
     step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
     scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
     final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
-    g = g * final_scale.to(g.dtype)
+    g = (g * final_scale.to(g.dtype)).to(stacked_params.dtype)
     # Cautious weight decay + parameter update
-    lr = float(lr_t)
-    wd = float(wd_t)
+    lr = lr_t.to(device=stacked_params.device, dtype=stacked_params.dtype)
+    wd = wd_t.to(device=stacked_params.device, dtype=stacked_params.dtype)
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 
@@ -378,19 +379,20 @@ def matrix_mix_step_fused(stacked_grads, stacked_params, momentum_buffer, second
     mu = X
     alpha = mix_alpha_t.to(mu.dtype)
     mixed = g.to(mu.dtype).lerp(mu, alpha)
-    beta2 = float(beta2_t)
+    beta2 = beta2_t.to(device=second_momentum_buffer.device, dtype=second_momentum_buffer.dtype)
     v_mean = mixed.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = mixed.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
     v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    target = v_mean.to(dtype=second_momentum_buffer.dtype)
+    second_momentum_buffer.mul_(beta2).add_(target * (1 - beta2))
     step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
     scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
     final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
-    mixed = mixed * final_scale.to(mixed.dtype)
-    lr = float(lr_t)
-    wd = float(wd_t)
+    mixed = (mixed * final_scale.to(mixed.dtype)).to(stacked_params.dtype)
+    lr = lr_t.to(device=stacked_params.device, dtype=stacked_params.dtype)
+    wd = wd_t.to(device=stacked_params.device, dtype=stacked_params.dtype)
     mask = (mixed * stacked_params) >= 0
     stacked_params.sub_(lr * mixed + lr * wd * stacked_params * mask)
 

@@ -570,6 +570,20 @@ LATE_EMBED_EXP_AVG_SHRINK = 0.65
 LATE_EMBED_EXP_AVG_SQ_SHRINK = 0.88
 LATE_SCALAR_EXP_AVG_SHRINK = 0.25
 LATE_SCALAR_EXP_AVG_SQ_SHRINK = 0.72
+SQUARE_MUON_PULSE_START = 0.76
+SQUARE_MUON_PULSE_PEAK = 0.82
+SQUARE_MUON_PULSE_END = 0.88
+SQUARE_MUON_PULSE_BOOST = 0.12
+TOKEN_EMBED_COOL_START = 0.54
+TOKEN_EMBED_COOL_MID = 0.72
+TOKEN_EMBED_COOL_END = 1.00
+TOKEN_EMBED_COOL_MID_FRAC = 0.78
+TOKEN_EMBED_COOL_FINAL_FRAC = 0.60
+VALUE_EMBED_COOL_START = 0.58
+VALUE_EMBED_COOL_MID = 0.76
+VALUE_EMBED_COOL_END = 1.00
+VALUE_EMBED_COOL_MID_FRAC = 0.84
+VALUE_EMBED_COOL_FINAL_FRAC = 0.68
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -689,6 +703,21 @@ def get_scalar_quiet_scale(subkind, progress):
     )
     return min(quiet_1, quiet_2)
 
+def get_embed_cool_scale(subkind, progress):
+    if subkind == 'token_embed':
+        if progress < TOKEN_EMBED_COOL_START:
+            return 1.0
+        if progress < TOKEN_EMBED_COOL_MID:
+            return lerp(1.0, TOKEN_EMBED_COOL_MID_FRAC, phase_mix(progress, TOKEN_EMBED_COOL_START, TOKEN_EMBED_COOL_MID))
+        return lerp(TOKEN_EMBED_COOL_MID_FRAC, TOKEN_EMBED_COOL_FINAL_FRAC, phase_mix(progress, TOKEN_EMBED_COOL_MID, TOKEN_EMBED_COOL_END))
+    if subkind == 'value_embed':
+        if progress < VALUE_EMBED_COOL_START:
+            return 1.0
+        if progress < VALUE_EMBED_COOL_MID:
+            return lerp(1.0, VALUE_EMBED_COOL_MID_FRAC, phase_mix(progress, VALUE_EMBED_COOL_START, VALUE_EMBED_COOL_MID))
+        return lerp(VALUE_EMBED_COOL_MID_FRAC, VALUE_EMBED_COOL_FINAL_FRAC, phase_mix(progress, VALUE_EMBED_COOL_MID, VALUE_EMBED_COOL_END))
+    return 1.0
+
 def get_adam_switchback_lr_profile(subkind):
     if subkind == 'lm_head':
         return 0.68, 1.05, 0.40, get_adam_final_lr_frac(subkind)
@@ -707,6 +736,13 @@ def get_muon_switchback_lr_profile(shape_class):
         return 0.98, 0.54, 0.72, get_muon_final_lr_frac(shape_class)
     return 0.92, 0.60, 0.74, get_muon_final_lr_frac(shape_class)
 
+def get_square_muon_pulse_scale(progress):
+    if progress < SQUARE_MUON_PULSE_START or progress > SQUARE_MUON_PULSE_END:
+        return 1.0
+    return 1.0 + SQUARE_MUON_PULSE_BOOST * cosine_bell(
+        progress, SQUARE_MUON_PULSE_START, SQUARE_MUON_PULSE_PEAK, SQUARE_MUON_PULSE_END
+    )
+
 def get_group_lr_multiplier(group, progress):
     if group['kind'] == 'muon':
         start_lr_frac, recap_lr_frac, recovery_lr_frac, final_lr_frac = get_muon_switchback_lr_profile(group['shape_class'])
@@ -719,6 +755,10 @@ def get_group_lr_multiplier(group, progress):
         base = lerp(recap_lr_frac, recovery_lr_frac, phase_mix(progress, SWITCHBACK_RECAP_START, SWITCHBACK_RECAP_END))
     else:
         base = lerp(recovery_lr_frac, final_lr_frac, phase_mix(progress, SWITCHBACK_RECAP_END, 1.0))
+    if group["kind"] == "muon" and group["shape_class"] == "square":
+        base *= get_square_muon_pulse_scale(progress)
+    if group["subkind"] in ("token_embed", "value_embed"):
+        base *= get_embed_cool_scale(group["subkind"], progress)
     if group["kind"] == "adamw" and group["subkind"] in ("resid", "x0"):
         return base * get_scalar_quiet_scale(group["subkind"], progress)
     return base

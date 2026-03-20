@@ -570,20 +570,29 @@ LATE_EMBED_EXP_AVG_SHRINK = 0.65
 LATE_EMBED_EXP_AVG_SQ_SHRINK = 0.88
 LATE_SCALAR_EXP_AVG_SHRINK = 0.25
 LATE_SCALAR_EXP_AVG_SQ_SHRINK = 0.72
-SQUARE_MUON_PULSE_START = 0.76
-SQUARE_MUON_PULSE_PEAK = 0.82
-SQUARE_MUON_PULSE_END = 0.88
-SQUARE_MUON_PULSE_BOOST = 0.12
-TOKEN_EMBED_COOL_START = 0.54
-TOKEN_EMBED_COOL_MID = 0.72
-TOKEN_EMBED_COOL_END = 1.00
-TOKEN_EMBED_COOL_MID_FRAC = 0.78
-TOKEN_EMBED_COOL_FINAL_FRAC = 0.60
-VALUE_EMBED_COOL_START = 0.58
-VALUE_EMBED_COOL_MID = 0.76
-VALUE_EMBED_COOL_END = 1.00
-VALUE_EMBED_COOL_MID_FRAC = 0.84
-VALUE_EMBED_COOL_FINAL_FRAC = 0.68
+OUTPUT_CLEANUP_START = 0.90
+OUTPUT_CLEANUP_PEAK = 0.96
+OUTPUT_CLEANUP_END = 1.00
+LM_HEAD_CLEANUP_BOOST = 0.12
+TOKEN_EMBED_CLEANUP_BOOST = 0.16
+SCALAR_CLEANUP_BOOST = 0.08
+TOKEN_EMBED_COOL_START = 0.22
+TOKEN_EMBED_COOL_MID = 0.40
+TOKEN_EMBED_COOL_END = 0.84
+TOKEN_EMBED_COOL_MID_FRAC = 0.76
+TOKEN_EMBED_COOL_FINAL_FRAC = 0.46
+VALUE_EMBED_COOL_START = 0.26
+VALUE_EMBED_COOL_MID = 0.44
+VALUE_EMBED_COOL_END = 0.72
+VALUE_EMBED_COOL_MID_FRAC = 0.92
+VALUE_EMBED_COOL_FINAL_FRAC = 0.96
+VALUE_EMBED_LATE_HEAT_START = 0.70
+VALUE_EMBED_LATE_HEAT_PEAK = 0.90
+VALUE_EMBED_LATE_HEAT_END = 1.00
+VALUE_EMBED_LATE_HEAT_BOOST = 0.10
+GEOMETRY_MUON_HEAT_START = 0.58
+GEOMETRY_MUON_RECT_BOOST = 0.05
+GEOMETRY_MUON_SQUARE_BOOST = 0.08
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -692,30 +701,55 @@ def get_muon_final_lr_frac(shape_class):
         return MUON_SQUARE_FINAL_LR_FRAC
     return MUON_RECT_FINAL_LR_FRAC
 
-def get_scalar_quiet_scale(subkind, progress):
-    quiet_1 = quiet_window_scale(
-        progress, SCALAR_QUIET_1_START, SCALAR_QUIET_1_PEAK, SCALAR_QUIET_1_END,
-        RESID_QUIET_1_FLOOR if subkind == 'resid' else X0_QUIET_1_FLOOR,
-    )
-    quiet_2 = quiet_window_scale(
-        progress, SCALAR_QUIET_2_START, SCALAR_QUIET_2_PEAK, SCALAR_QUIET_2_END,
-        RESID_QUIET_2_FLOOR if subkind == 'resid' else X0_QUIET_2_FLOOR,
-    )
-    return min(quiet_1, quiet_2)
+def cooldown_hold_scale(progress, start, mid, end, floor):
+    if progress < start:
+        return 1.0
+    if progress < mid:
+        return lerp(1.0, floor, phase_mix(progress, start, mid))
+    return lerp(floor, floor, phase_mix(progress, mid, end))
 
-def get_embed_cool_scale(subkind, progress):
+def cleanup_wedge_scale(progress, boost):
+    return 1.0 + boost * cosine_bell(progress, OUTPUT_CLEANUP_START, OUTPUT_CLEANUP_PEAK, OUTPUT_CLEANUP_END)
+
+def get_output_handoff_scale(subkind, progress):
+    if subkind == 'lm_head':
+        cool = cooldown_hold_scale(progress, 0.26, 0.46, 0.86, 0.56)
+        return cool * cleanup_wedge_scale(progress, LM_HEAD_CLEANUP_BOOST)
     if subkind == 'token_embed':
-        if progress < TOKEN_EMBED_COOL_START:
-            return 1.0
-        if progress < TOKEN_EMBED_COOL_MID:
-            return lerp(1.0, TOKEN_EMBED_COOL_MID_FRAC, phase_mix(progress, TOKEN_EMBED_COOL_START, TOKEN_EMBED_COOL_MID))
-        return lerp(TOKEN_EMBED_COOL_MID_FRAC, TOKEN_EMBED_COOL_FINAL_FRAC, phase_mix(progress, TOKEN_EMBED_COOL_MID, TOKEN_EMBED_COOL_END))
-    if subkind == 'value_embed':
-        if progress < VALUE_EMBED_COOL_START:
-            return 1.0
-        if progress < VALUE_EMBED_COOL_MID:
-            return lerp(1.0, VALUE_EMBED_COOL_MID_FRAC, phase_mix(progress, VALUE_EMBED_COOL_START, VALUE_EMBED_COOL_MID))
-        return lerp(VALUE_EMBED_COOL_MID_FRAC, VALUE_EMBED_COOL_FINAL_FRAC, phase_mix(progress, VALUE_EMBED_COOL_MID, VALUE_EMBED_COOL_END))
+        cool = cooldown_hold_scale(progress, TOKEN_EMBED_COOL_START, TOKEN_EMBED_COOL_MID, TOKEN_EMBED_COOL_END,
+                                   TOKEN_EMBED_COOL_FINAL_FRAC)
+        return cool * cleanup_wedge_scale(progress, TOKEN_EMBED_CLEANUP_BOOST)
+    if subkind == 'resid':
+        cool = cooldown_hold_scale(progress, SCALAR_QUIET_1_START, SCALAR_QUIET_1_PEAK, SCALAR_QUIET_1_END, 0.72)
+        cool *= cooldown_hold_scale(progress, SCALAR_QUIET_2_START, SCALAR_QUIET_2_PEAK, SCALAR_QUIET_2_END, 0.84)
+        return cool * cleanup_wedge_scale(progress, SCALAR_CLEANUP_BOOST)
+    if subkind == 'x0':
+        cool = cooldown_hold_scale(progress, SCALAR_QUIET_1_START, SCALAR_QUIET_1_PEAK, SCALAR_QUIET_1_END, 0.80)
+        cool *= cooldown_hold_scale(progress, SCALAR_QUIET_2_START, SCALAR_QUIET_2_PEAK, SCALAR_QUIET_2_END, 0.90)
+        return cool * cleanup_wedge_scale(progress, SCALAR_CLEANUP_BOOST)
+    return 1.0
+
+def get_value_geometry_scale(progress):
+    cool = cooldown_hold_scale(
+        progress, VALUE_EMBED_COOL_START, VALUE_EMBED_COOL_MID, VALUE_EMBED_COOL_END,
+        VALUE_EMBED_COOL_MID_FRAC,
+    )
+    late_heat = 1.0
+    if progress >= VALUE_EMBED_LATE_HEAT_START:
+        late_heat = lerp(1.0, 1.0 + VALUE_EMBED_LATE_HEAT_BOOST, phase_mix(progress, VALUE_EMBED_LATE_HEAT_START, VALUE_EMBED_LATE_HEAT_END))
+    return cool * late_heat
+
+def get_muon_geometry_scale(shape_class, progress):
+    boost = GEOMETRY_MUON_SQUARE_BOOST if shape_class == 'square' else GEOMETRY_MUON_RECT_BOOST
+    if progress < GEOMETRY_MUON_HEAT_START:
+        return 1.0
+    return lerp(1.0, 1.0 + boost, phase_mix(progress, GEOMETRY_MUON_HEAT_START, 1.0))
+
+def get_geometry_bank_scale(group, progress):
+    if group["kind"] == "muon":
+        return get_muon_geometry_scale(group["shape_class"], progress)
+    if group.get("subkind") == 'value_embed':
+        return get_value_geometry_scale(progress)
     return 1.0
 
 def get_adam_switchback_lr_profile(subkind):
@@ -757,12 +791,10 @@ def get_group_lr_multiplier(group, progress):
         base = lerp(recap_lr_frac, recovery_lr_frac, phase_mix(progress, SWITCHBACK_RECAP_START, SWITCHBACK_RECAP_END))
     else:
         base = lerp(recovery_lr_frac, final_lr_frac, phase_mix(progress, SWITCHBACK_RECAP_END, 1.0))
-    if kind == "muon" and group["shape_class"] == "square":
-        base *= get_square_muon_pulse_scale(progress)
-    if subkind in ("token_embed", "value_embed"):
-        base *= get_embed_cool_scale(subkind, progress)
-    if kind == "adamw" and subkind in ("resid", "x0"):
-        return base * get_scalar_quiet_scale(subkind, progress)
+    if kind == "muon" or subkind == "value_embed":
+        return base * get_geometry_bank_scale(group, progress)
+    if kind == "adamw" and subkind in ("lm_head", "token_embed", "resid", "x0"):
+        return base * get_output_handoff_scale(subkind, progress)
     return base
 
 def get_muon_momentum(step, progress, shape_class):

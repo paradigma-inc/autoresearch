@@ -247,17 +247,21 @@ class GPT(nn.Module):
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
+        def classify_shape(shape):
+            rows, cols = shape
+            aspect = max(rows, cols) / min(rows, cols)
+            return "square" if aspect <= 1.5 else "rect"
         param_groups = [
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', subkind='lm_head', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', subkind='token_embed', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', subkind='value_embed', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', subkind='resid', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', subkind='x0', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
+                kind='muon', shape_class=classify_shape(shape), params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
             ))
         optimizer = MuonAdamW(param_groups)
@@ -445,19 +449,19 @@ ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.125   # probe whether pushing above the 10% winner still helps
-ADAM_FINAL_LR_FRAC = 0.02 # keep Adam-managed groups very cold in the last third
-MUON_FINAL_LR_FRAC = 0.18 # slightly cooler floor than Attempt 029 before the pulse
-AFTERBURNER_START = 0.80
-AFTERBURNER_END = 0.94
-AFTERBURNER_BUMP = 0.12
-MUON_RELEASE_START = 0.82
-MUON_FINAL_MOMENTUM = 0.90
-MUON_BETA2_RELEASE_START = 0.80
-MUON_FINAL_BETA2 = 0.88
-DECAY_REBOUND_START = 0.82
-DECAY_REBOUND_END = 0.97
-DECAY_REBOUND_FRAC = 0.55
-MIN_WEIGHT_DECAY_FRAC = 0.10
+HEAD_FINAL_LR_FRAC = 0.08
+TOKEN_EMBED_FINAL_LR_FRAC = 0.03
+VALUE_EMBED_FINAL_LR_FRAC = 0.05
+RESID_FINAL_LR_FRAC = 0.10
+X0_FINAL_LR_FRAC = 0.18
+MUON_SQUARE_FINAL_LR_FRAC = 0.24
+MUON_RECT_FINAL_LR_FRAC = 0.16
+MUON_RELEASE_START = 0.76
+MUON_BETA2_RELEASE_START = 0.72
+MUON_SQUARE_FINAL_MOMENTUM = 0.90
+MUON_RECT_FINAL_MOMENTUM = 0.93
+MUON_SQUARE_FINAL_BETA2 = 0.89
+MUON_RECT_FINAL_BETA2 = 0.92
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -537,40 +541,56 @@ def get_lr_multiplier(progress):
         cooldown = (1.0 - progress) / WARMDOWN_RATIO
         return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
 
-def get_group_lr_multiplier(kind, progress):
+def get_adam_final_lr_frac(subkind):
+    if subkind == 'lm_head':
+        return HEAD_FINAL_LR_FRAC
+    if subkind == 'token_embed':
+        return TOKEN_EMBED_FINAL_LR_FRAC
+    if subkind == 'value_embed':
+        return VALUE_EMBED_FINAL_LR_FRAC
+    if subkind == 'resid':
+        return RESID_FINAL_LR_FRAC
+    if subkind == 'x0':
+        return X0_FINAL_LR_FRAC
+    return FINAL_LR_FRAC
+
+def get_muon_final_lr_frac(shape_class):
+    if shape_class == 'square':
+        return MUON_SQUARE_FINAL_LR_FRAC
+    return MUON_RECT_FINAL_LR_FRAC
+
+def get_group_lr_multiplier(group, progress):
     if progress < WARMUP_RATIO:
         base = progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
     elif progress < 1.0 - WARMDOWN_RATIO:
         base = 1.0
     else:
         cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        final_lr_frac = MUON_FINAL_LR_FRAC if kind == 'muon' else ADAM_FINAL_LR_FRAC
+        if group['kind'] == 'muon':
+            final_lr_frac = get_muon_final_lr_frac(group['shape_class'])
+        else:
+            final_lr_frac = get_adam_final_lr_frac(group['subkind'])
         base = cooldown * 1.0 + (1 - cooldown) * final_lr_frac
-    if kind == 'muon' and AFTERBURNER_START <= progress <= AFTERBURNER_END:
-        phase = (progress - AFTERBURNER_START) / (AFTERBURNER_END - AFTERBURNER_START)
-        base += AFTERBURNER_BUMP * math.sin(math.pi * phase)
     return base
 
-def get_muon_momentum(step, progress):
+def get_muon_momentum(step, progress, shape_class):
     frac = min(step / 300, 1)
     base_momentum = (1 - frac) * 0.85 + frac * 0.95
     if progress < MUON_RELEASE_START:
         return base_momentum
     tail_progress = (progress - MUON_RELEASE_START) / (1.0 - MUON_RELEASE_START)
-    return base_momentum * (1.0 - tail_progress) + MUON_FINAL_MOMENTUM * tail_progress
+    final_momentum = MUON_SQUARE_FINAL_MOMENTUM if shape_class == 'square' else MUON_RECT_FINAL_MOMENTUM
+    return base_momentum * (1.0 - tail_progress) + final_momentum * tail_progress
 
-def get_muon_beta2(progress):
+def get_muon_beta2(progress, shape_class):
     if progress < MUON_BETA2_RELEASE_START:
         return 0.95
     tail_progress = (progress - MUON_BETA2_RELEASE_START) / (1.0 - MUON_BETA2_RELEASE_START)
-    return 0.95 * (1.0 - tail_progress) + MUON_FINAL_BETA2 * tail_progress
+    final_beta2 = MUON_SQUARE_FINAL_BETA2 if shape_class == 'square' else MUON_RECT_FINAL_BETA2
+    return 0.95 * (1.0 - tail_progress) + final_beta2 * tail_progress
 
 def get_weight_decay(progress):
-    base = max(WEIGHT_DECAY * MIN_WEIGHT_DECAY_FRAC, WEIGHT_DECAY * (1 - progress))
-    if DECAY_REBOUND_START <= progress <= DECAY_REBOUND_END:
-        phase = (progress - DECAY_REBOUND_START) / (DECAY_REBOUND_END - DECAY_REBOUND_START)
-        base += WEIGHT_DECAY * DECAY_REBOUND_FRAC * math.sin(math.pi * phase)
-    return base
+    return WEIGHT_DECAY * (1 - progress)
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -594,16 +614,18 @@ while True:
 
     # Progress and schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
-    report_lrm = get_group_lr_multiplier('muon', progress)
-    muon_momentum = get_muon_momentum(step, progress)
-    muon_beta2 = get_muon_beta2(progress)
     muon_weight_decay = get_weight_decay(progress)
+    report_lrm = None
     for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * get_group_lr_multiplier(group["kind"], progress)
+        group["lr"] = group["initial_lr"] * get_group_lr_multiplier(group, progress)
         if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
-            group["beta2"] = muon_beta2
+            group["momentum"] = get_muon_momentum(step, progress, group["shape_class"])
+            group["beta2"] = get_muon_beta2(progress, group["shape_class"])
             group["weight_decay"] = muon_weight_decay
+            if report_lrm is None and group["shape_class"] == "square":
+                report_lrm = group["lr"] / group["initial_lr"]
+    if report_lrm is None:
+        report_lrm = 0.0
     optimizer.step()
     model.zero_grad(set_to_none=True)
 

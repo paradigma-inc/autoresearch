@@ -446,9 +446,10 @@ MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.125   # probe whether pushing above the 10% winner still helps
+# Three-phase switchback: Muon-heavy explore -> short Adam recap -> Muon-biased finish.
+SWITCHBACK_RECAP_START = 0.68
+SWITCHBACK_RECAP_END = 0.84
+FINAL_LR_FRAC = 0.125   # fallback final LR fraction for uncategorized Adam groups
 HEAD_FINAL_LR_FRAC = 0.08
 TOKEN_EMBED_FINAL_LR_FRAC = 0.03
 VALUE_EMBED_FINAL_LR_FRAC = 0.05
@@ -456,8 +457,6 @@ RESID_FINAL_LR_FRAC = 0.10
 X0_FINAL_LR_FRAC = 0.18
 MUON_SQUARE_FINAL_LR_FRAC = 0.24
 MUON_RECT_FINAL_LR_FRAC = 0.16
-MUON_RELEASE_START = 0.76
-MUON_BETA2_RELEASE_START = 0.72
 MUON_SQUARE_FINAL_MOMENTUM = 0.90
 MUON_RECT_FINAL_MOMENTUM = 0.93
 MUON_SQUARE_FINAL_BETA2 = 0.89
@@ -532,14 +531,13 @@ print(f"Gradient accumulation steps: {grad_accum_steps}")
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 
-def get_lr_multiplier(progress):
-    if progress < WARMUP_RATIO:
-        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
-    elif progress < 1.0 - WARMDOWN_RATIO:
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+def phase_mix(progress, start, end):
+    if end <= start:
         return 1.0
-    else:
-        cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
+    return max(0.0, min(1.0, (progress - start) / (end - start)))
 
 def get_adam_final_lr_frac(subkind):
     if subkind == 'lm_head':
@@ -559,35 +557,52 @@ def get_muon_final_lr_frac(shape_class):
         return MUON_SQUARE_FINAL_LR_FRAC
     return MUON_RECT_FINAL_LR_FRAC
 
+def get_adam_switchback_lr_profile(subkind):
+    if subkind == 'lm_head':
+        return 0.68, 1.05, 0.40, get_adam_final_lr_frac(subkind)
+    if subkind == 'token_embed':
+        return 0.55, 0.42, 0.24, get_adam_final_lr_frac(subkind)
+    if subkind == 'value_embed':
+        return 0.58, 0.48, 0.28, get_adam_final_lr_frac(subkind)
+    if subkind == 'resid':
+        return 0.84, 1.10, 0.52, get_adam_final_lr_frac(subkind)
+    if subkind == 'x0':
+        return 0.92, 1.18, 0.58, get_adam_final_lr_frac(subkind)
+    return 0.60, 0.85, 0.35, get_adam_final_lr_frac(subkind)
+
+def get_muon_switchback_lr_profile(shape_class):
+    if shape_class == 'square':
+        return 0.98, 0.54, 0.72, get_muon_final_lr_frac(shape_class)
+    return 0.92, 0.60, 0.74, get_muon_final_lr_frac(shape_class)
+
 def get_group_lr_multiplier(group, progress):
-    if progress < WARMUP_RATIO:
-        base = progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
-    elif progress < 1.0 - WARMDOWN_RATIO:
-        base = 1.0
+    if group['kind'] == 'muon':
+        start_lr_frac, recap_lr_frac, recovery_lr_frac, final_lr_frac = get_muon_switchback_lr_profile(group['shape_class'])
     else:
-        cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        if group['kind'] == 'muon':
-            final_lr_frac = get_muon_final_lr_frac(group['shape_class'])
-        else:
-            final_lr_frac = get_adam_final_lr_frac(group['subkind'])
-        base = cooldown * 1.0 + (1 - cooldown) * final_lr_frac
-    return base
+        start_lr_frac, recap_lr_frac, recovery_lr_frac, final_lr_frac = get_adam_switchback_lr_profile(group['subkind'])
+
+    if progress < SWITCHBACK_RECAP_START:
+        return lerp(start_lr_frac, recap_lr_frac, phase_mix(progress, 0.0, SWITCHBACK_RECAP_START))
+    if progress < SWITCHBACK_RECAP_END:
+        return lerp(recap_lr_frac, recovery_lr_frac, phase_mix(progress, SWITCHBACK_RECAP_START, SWITCHBACK_RECAP_END))
+    return lerp(recovery_lr_frac, final_lr_frac, phase_mix(progress, SWITCHBACK_RECAP_END, 1.0))
 
 def get_muon_momentum(step, progress, shape_class):
-    frac = min(step / 300, 1)
-    base_momentum = (1 - frac) * 0.85 + frac * 0.95
-    if progress < MUON_RELEASE_START:
-        return base_momentum
-    tail_progress = (progress - MUON_RELEASE_START) / (1.0 - MUON_RELEASE_START)
+    warm_momentum = lerp(0.86, 0.95, min(step / 300, 1))
+    if progress < SWITCHBACK_RECAP_START:
+        return lerp(warm_momentum, 0.95, phase_mix(progress, 0.0, SWITCHBACK_RECAP_START))
+    if progress < SWITCHBACK_RECAP_END:
+        return lerp(0.95, 0.88, phase_mix(progress, SWITCHBACK_RECAP_START, SWITCHBACK_RECAP_END))
     final_momentum = MUON_SQUARE_FINAL_MOMENTUM if shape_class == 'square' else MUON_RECT_FINAL_MOMENTUM
-    return base_momentum * (1.0 - tail_progress) + final_momentum * tail_progress
+    return lerp(0.88, final_momentum, phase_mix(progress, SWITCHBACK_RECAP_END, 1.0))
 
 def get_muon_beta2(progress, shape_class):
-    if progress < MUON_BETA2_RELEASE_START:
+    if progress < SWITCHBACK_RECAP_START:
         return 0.95
-    tail_progress = (progress - MUON_BETA2_RELEASE_START) / (1.0 - MUON_BETA2_RELEASE_START)
+    if progress < SWITCHBACK_RECAP_END:
+        return lerp(0.95, 0.91, phase_mix(progress, SWITCHBACK_RECAP_START, SWITCHBACK_RECAP_END))
     final_beta2 = MUON_SQUARE_FINAL_BETA2 if shape_class == 'square' else MUON_RECT_FINAL_BETA2
-    return 0.95 * (1.0 - tail_progress) + final_beta2 * tail_progress
+    return lerp(0.91, final_beta2, phase_mix(progress, SWITCHBACK_RECAP_END, 1.0))
 
 def get_weight_decay(progress):
     return WEIGHT_DECAY * (1 - progress)

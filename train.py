@@ -451,6 +451,12 @@ MUON_RELEASE_START = 0.75
 MUON_FINAL_MOMENTUM = 0.91
 MUON_BETA2_RELEASE_START = 0.70
 MUON_FINAL_BETA2 = 0.90
+MUON_TAIL_START = 0.80
+MUON_TAIL_CLIFF_RATIO = 0.06
+ADAM_TAIL_START = 0.84
+ADAM_TAIL_CLIFF_RATIO = 0.08
+WEIGHT_DECAY_TAIL_START = 0.82
+WEIGHT_DECAY_TAIL_CLIFF_RATIO = 0.06
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -533,12 +539,16 @@ def get_lr_multiplier(progress):
 def get_group_lr_multiplier(kind, progress):
     if progress < WARMUP_RATIO:
         return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
-    elif progress < 1.0 - WARMDOWN_RATIO:
+    tail_start = MUON_TAIL_START if kind == 'muon' else ADAM_TAIL_START
+    cliff_ratio = MUON_TAIL_CLIFF_RATIO if kind == 'muon' else ADAM_TAIL_CLIFF_RATIO
+    final_lr_frac = MUON_FINAL_LR_FRAC if kind == 'muon' else ADAM_FINAL_LR_FRAC
+    if progress < tail_start:
         return 1.0
-    else:
-        cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        final_lr_frac = MUON_FINAL_LR_FRAC if kind == 'muon' else ADAM_FINAL_LR_FRAC
-        return cooldown * 1.0 + (1 - cooldown) * final_lr_frac
+    cliff_end = min(1.0, tail_start + cliff_ratio)
+    if progress < cliff_end:
+        cliff_progress = (progress - tail_start) / max(cliff_end - tail_start, 1e-8)
+        return 1.0 * (1.0 - cliff_progress) + final_lr_frac * cliff_progress
+    return final_lr_frac
 
 def get_muon_momentum(step, progress):
     frac = min(step / 300, 1)
@@ -555,7 +565,13 @@ def get_muon_beta2(progress):
     return 0.95 * (1.0 - tail_progress) + MUON_FINAL_BETA2 * tail_progress
 
 def get_weight_decay(progress):
-    return WEIGHT_DECAY * (1 - progress)
+    if progress < WEIGHT_DECAY_TAIL_START:
+        return WEIGHT_DECAY
+    cliff_end = min(1.0, WEIGHT_DECAY_TAIL_START + WEIGHT_DECAY_TAIL_CLIFF_RATIO)
+    if progress < cliff_end:
+        cliff_progress = (progress - WEIGHT_DECAY_TAIL_START) / max(cliff_end - WEIGHT_DECAY_TAIL_START, 1e-8)
+        return WEIGHT_DECAY * (1.0 - cliff_progress)
+    return 0.0
 
 # ---------------------------------------------------------------------------
 # Training loop

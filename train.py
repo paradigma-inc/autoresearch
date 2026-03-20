@@ -384,6 +384,7 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._schedule_progress = 0.0
+        self._late_handoff_applied = False
 
     def set_schedule_progress(self, progress):
         self._schedule_progress = progress
@@ -400,6 +401,49 @@ class MuonAdamW(torch.optim.Optimizer):
                 state["momentum_buffer"].mul_(RECT_MUON_MOMENTUM_SHRINK)
                 state["second_momentum_buffer"].mul_(RECT_MUON_SECOND_SHRINK)
                 state["reset_ladder_stage"] = 2
+
+    def maybe_apply_late_handoff(self, progress):
+        if self._late_handoff_applied or progress < LATE_ACCUM_START:
+            return
+        for group in self.param_groups:
+            if group["kind"] == "muon":
+                params = group["params"]
+                if not params:
+                    continue
+                state = self.state.get(params[0])
+                if not state:
+                    continue
+                if group["shape_class"] == "square":
+                    momentum_shrink = LATE_SQUARE_MUON_MOMENTUM_SHRINK
+                    second_shrink = LATE_SQUARE_MUON_SECOND_SHRINK
+                else:
+                    momentum_shrink = LATE_RECT_MUON_MOMENTUM_SHRINK
+                    second_shrink = LATE_RECT_MUON_SECOND_SHRINK
+                if "momentum_buffer" in state:
+                    state["momentum_buffer"].mul_(momentum_shrink)
+                if "second_momentum_buffer" in state:
+                    state["second_momentum_buffer"].mul_(second_shrink)
+                continue
+
+            if group["subkind"] in ("resid", "x0"):
+                exp_avg_shrink = LATE_SCALAR_EXP_AVG_SHRINK
+                exp_avg_sq_shrink = LATE_SCALAR_EXP_AVG_SQ_SHRINK
+            elif group["subkind"] == "lm_head":
+                exp_avg_shrink = LATE_HEAD_EXP_AVG_SHRINK
+                exp_avg_sq_shrink = LATE_HEAD_EXP_AVG_SQ_SHRINK
+            else:
+                exp_avg_shrink = LATE_EMBED_EXP_AVG_SHRINK
+                exp_avg_sq_shrink = LATE_EMBED_EXP_AVG_SQ_SHRINK
+
+            for p in group["params"]:
+                state = self.state.get(p)
+                if not state:
+                    continue
+                if "exp_avg" in state:
+                    state["exp_avg"].mul_(exp_avg_shrink)
+                if "exp_avg_sq" in state:
+                    state["exp_avg_sq"].mul_(exp_avg_sq_shrink)
+        self._late_handoff_applied = True
 
     def _step_adamw(self, group):
         for p in group['params']:
@@ -514,6 +558,18 @@ WEIGHT_DECAY_REBOUND = 0.06
 WEIGHT_DECAY_REBOUND_START = 0.76
 WEIGHT_DECAY_REBOUND_PEAK = 0.90
 WEIGHT_DECAY_REBOUND_END = 1.00
+LATE_ACCUM_START = 0.82
+LATE_ACCUM_STEP_DELTA = 1
+LATE_SQUARE_MUON_MOMENTUM_SHRINK = 0.58
+LATE_SQUARE_MUON_SECOND_SHRINK = 0.78
+LATE_RECT_MUON_MOMENTUM_SHRINK = 0.70
+LATE_RECT_MUON_SECOND_SHRINK = 0.86
+LATE_HEAD_EXP_AVG_SHRINK = 0.55
+LATE_HEAD_EXP_AVG_SQ_SHRINK = 0.84
+LATE_EMBED_EXP_AVG_SHRINK = 0.65
+LATE_EMBED_EXP_AVG_SQ_SHRINK = 0.88
+LATE_SCALAR_EXP_AVG_SHRINK = 0.25
+LATE_SCALAR_EXP_AVG_SQ_SHRINK = 0.72
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -563,7 +619,8 @@ print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
 tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+base_grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+tail_grad_accum_steps = base_grad_accum_steps + LATE_ACCUM_STEP_DELTA
 
 optimizer = model.setup_optimizer(
     unembedding_lr=UNEMBEDDING_LR,
@@ -580,7 +637,8 @@ train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train
 x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
-print(f"Gradient accumulation steps: {grad_accum_steps}")
+print(f"Base gradient accumulation steps: {base_grad_accum_steps}")
+print(f"Tail gradient accumulation steps: {tail_grad_accum_steps} (starts at progress {LATE_ACCUM_START:.2f})")
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 
@@ -689,6 +747,11 @@ def get_weight_decay(progress):
     )
     return base + rebound
 
+def get_grad_accum_steps(progress):
+    if progress < LATE_ACCUM_START:
+        return base_grad_accum_steps
+    return tail_grad_accum_steps
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -696,21 +759,27 @@ def get_weight_decay(progress):
 t_start_training = time.time()
 smooth_train_loss = 0
 total_training_time = 0
+total_tokens = 0
+measured_tokens = 0
 step = 0
 
 while True:
+    progress = min(total_training_time / TIME_BUDGET, 1.0)
+    current_grad_accum_steps = get_grad_accum_steps(progress)
+    current_total_batch_size = current_grad_accum_steps * tokens_per_fwdbwd
+    optimizer.set_schedule_progress(progress)
+    optimizer.maybe_apply_late_handoff(progress)
     torch.cuda.synchronize()
     t0 = time.time()
-    for micro_step in range(grad_accum_steps):
+    for micro_step in range(current_grad_accum_steps):
         with autocast_ctx:
             loss = model(x, y)
         train_loss = loss.detach()
-        loss = loss / grad_accum_steps
+        loss = loss / current_grad_accum_steps
         loss.backward()
         x, y, epoch = next(train_loader)
 
     # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
     muon_weight_decay = get_weight_decay(progress)
     report_lrm = None
     optimizer.set_schedule_progress(progress)
@@ -740,17 +809,19 @@ while True:
 
     if step > 10:
         total_training_time += dt
+        measured_tokens += current_total_batch_size
+    total_tokens += current_total_batch_size
 
     # Logging
     ema_beta = 0.9
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    tok_per_sec = int(current_total_batch_size / dt)
+    mfu = 100 * num_flops_per_token * current_total_batch_size / dt / H100_BF16_PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {report_lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {report_lrm:.2f} | accum: {current_grad_accum_steps} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
@@ -768,8 +839,6 @@ while True:
 
 print()  # newline after \r training log
 
-total_tokens = step * TOTAL_BATCH_SIZE
-
 # Final eval
 model.eval()
 with autocast_ctx:
@@ -778,7 +847,7 @@ with autocast_ctx:
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+steady_state_mfu = 100 * num_flops_per_token * measured_tokens / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
 print("---")

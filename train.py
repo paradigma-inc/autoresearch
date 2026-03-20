@@ -384,6 +384,9 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._schedule_progress = 0.0
+        self._freshness_adam_applied = False
+        self._freshness_rect_applied = False
+        self._freshness_square_applied = False
         self._late_handoff_applied = False
 
     def set_schedule_progress(self, progress):
@@ -444,6 +447,59 @@ class MuonAdamW(torch.optim.Optimizer):
                 if "exp_avg_sq" in state:
                     state["exp_avg_sq"].mul_(exp_avg_sq_shrink)
         self._late_handoff_applied = True
+
+    def maybe_apply_freshness_ladder(self, progress):
+        if not self._freshness_adam_applied and progress >= FRESHNESS_ADAM_START:
+            for group in self.param_groups:
+                if group["kind"] != "adamw" or group["subkind"] not in ("lm_head", "token_embed", "value_embed"):
+                    continue
+                if group["subkind"] == "lm_head":
+                    exp_avg_shrink = FRESHNESS_HEAD_EXP_AVG_SHRINK
+                    exp_avg_sq_shrink = FRESHNESS_HEAD_EXP_AVG_SQ_SHRINK
+                else:
+                    exp_avg_shrink = FRESHNESS_EMBED_EXP_AVG_SHRINK
+                    exp_avg_sq_shrink = FRESHNESS_EMBED_EXP_AVG_SQ_SHRINK
+                for p in group["params"]:
+                    state = self.state.get(p)
+                    if not state:
+                        continue
+                    if "exp_avg" in state:
+                        state["exp_avg"].mul_(exp_avg_shrink)
+                    if "exp_avg_sq" in state:
+                        state["exp_avg_sq"].mul_(exp_avg_sq_shrink)
+            self._freshness_adam_applied = True
+
+        if not self._freshness_rect_applied and progress >= FRESHNESS_RECT_MUON_START:
+            for group in self.param_groups:
+                if group["kind"] != "muon" or group["shape_class"] != "rect":
+                    continue
+                params = group["params"]
+                if not params:
+                    continue
+                state = self.state.get(params[0])
+                if not state:
+                    continue
+                if "momentum_buffer" in state:
+                    state["momentum_buffer"].mul_(FRESHNESS_RECT_MUON_MOMENTUM_SHRINK)
+                if "second_momentum_buffer" in state:
+                    state["second_momentum_buffer"].mul_(FRESHNESS_RECT_MUON_SECOND_SHRINK)
+            self._freshness_rect_applied = True
+
+        if not self._freshness_square_applied and progress >= FRESHNESS_SQUARE_MUON_START:
+            for group in self.param_groups:
+                if group["kind"] != "muon" or group["shape_class"] != "square":
+                    continue
+                params = group["params"]
+                if not params:
+                    continue
+                state = self.state.get(params[0])
+                if not state:
+                    continue
+                if "momentum_buffer" in state:
+                    state["momentum_buffer"].mul_(FRESHNESS_SQUARE_MUON_MOMENTUM_SHRINK)
+                if "second_momentum_buffer" in state:
+                    state["second_momentum_buffer"].mul_(FRESHNESS_SQUARE_MUON_SECOND_SHRINK)
+            self._freshness_square_applied = True
 
     def _step_adamw(self, group):
         for p in group['params']:
@@ -571,6 +627,17 @@ LATE_EMBED_EXP_AVG_SHRINK = 0.65
 LATE_EMBED_EXP_AVG_SQ_SHRINK = 0.88
 LATE_SCALAR_EXP_AVG_SHRINK = 0.25
 LATE_SCALAR_EXP_AVG_SQ_SHRINK = 0.72
+FRESHNESS_ADAM_START = 0.72
+FRESHNESS_RECT_MUON_START = 0.84
+FRESHNESS_SQUARE_MUON_START = 0.90
+FRESHNESS_HEAD_EXP_AVG_SHRINK = 0.74
+FRESHNESS_HEAD_EXP_AVG_SQ_SHRINK = 0.90
+FRESHNESS_EMBED_EXP_AVG_SHRINK = 0.84
+FRESHNESS_EMBED_EXP_AVG_SQ_SHRINK = 0.94
+FRESHNESS_RECT_MUON_MOMENTUM_SHRINK = 0.90
+FRESHNESS_RECT_MUON_SECOND_SHRINK = 0.95
+FRESHNESS_SQUARE_MUON_MOMENTUM_SHRINK = 0.92
+FRESHNESS_SQUARE_MUON_SECOND_SHRINK = 0.96
 OUTPUT_CLEANUP_START = 0.90
 OUTPUT_CLEANUP_PEAK = 0.96
 OUTPUT_CLEANUP_END = 1.00
@@ -836,6 +903,7 @@ while True:
     current_grad_accum_steps = get_grad_accum_steps(progress)
     current_total_batch_size = current_grad_accum_steps * tokens_per_fwdbwd
     optimizer.set_schedule_progress(progress)
+    optimizer.maybe_apply_freshness_ladder(progress)
     optimizer.maybe_apply_late_handoff(progress)
     torch.cuda.synchronize()
     t0 = time.time()

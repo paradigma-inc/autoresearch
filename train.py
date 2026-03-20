@@ -445,12 +445,14 @@ ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.125   # probe whether pushing above the 10% winner still helps
-ADAM_FINAL_LR_FRAC = 0.05 # cool Adam-managed groups more aggressively late
+ADAM_FREEZE_START = 0.76
+ADAM_FROZEN_LR_FRAC = 0.02
 MUON_FINAL_LR_FRAC = 0.20 # keep matrix weights hotter late than the rest
 MUON_RELEASE_START = 0.75
 MUON_FINAL_MOMENTUM = 0.91
 MUON_BETA2_RELEASE_START = 0.70
 MUON_FINAL_BETA2 = 0.90
+MIN_WEIGHT_DECAY_FRAC = 0.25
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -531,14 +533,18 @@ def get_lr_multiplier(progress):
         return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
 
 def get_group_lr_multiplier(kind, progress):
+    tail_start = 1.0 - WARMDOWN_RATIO
     if progress < WARMUP_RATIO:
         return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
-    elif progress < 1.0 - WARMDOWN_RATIO:
+    elif progress < tail_start:
         return 1.0
-    else:
+    if kind == 'muon':
         cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        final_lr_frac = MUON_FINAL_LR_FRAC if kind == 'muon' else ADAM_FINAL_LR_FRAC
-        return cooldown * 1.0 + (1 - cooldown) * final_lr_frac
+        return cooldown * 1.0 + (1 - cooldown) * MUON_FINAL_LR_FRAC
+    if progress < ADAM_FREEZE_START:
+        phase = (progress - tail_start) / (ADAM_FREEZE_START - tail_start)
+        return 1.0 + (ADAM_FROZEN_LR_FRAC - 1.0) * phase
+    return ADAM_FROZEN_LR_FRAC
 
 def get_muon_momentum(step, progress):
     frac = min(step / 300, 1)
@@ -555,7 +561,7 @@ def get_muon_beta2(progress):
     return 0.95 * (1.0 - tail_progress) + MUON_FINAL_BETA2 * tail_progress
 
 def get_weight_decay(progress):
-    return WEIGHT_DECAY * (1 - progress)
+    return max(WEIGHT_DECAY * MIN_WEIGHT_DECAY_FRAC, WEIGHT_DECAY * (1 - progress))
 
 # ---------------------------------------------------------------------------
 # Training loop

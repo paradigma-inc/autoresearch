@@ -744,10 +744,12 @@ def get_square_muon_pulse_scale(progress):
     )
 
 def get_group_lr_multiplier(group, progress):
-    if group['kind'] == 'muon':
+    kind = group["kind"]
+    subkind = group.get("subkind")
+    if kind == 'muon':
         start_lr_frac, recap_lr_frac, recovery_lr_frac, final_lr_frac = get_muon_switchback_lr_profile(group['shape_class'])
     else:
-        start_lr_frac, recap_lr_frac, recovery_lr_frac, final_lr_frac = get_adam_switchback_lr_profile(group['subkind'])
+        start_lr_frac, recap_lr_frac, recovery_lr_frac, final_lr_frac = get_adam_switchback_lr_profile(subkind)
 
     if progress < SWITCHBACK_RECAP_START:
         base = lerp(start_lr_frac, recap_lr_frac, phase_mix(progress, 0.0, SWITCHBACK_RECAP_START))
@@ -755,12 +757,12 @@ def get_group_lr_multiplier(group, progress):
         base = lerp(recap_lr_frac, recovery_lr_frac, phase_mix(progress, SWITCHBACK_RECAP_START, SWITCHBACK_RECAP_END))
     else:
         base = lerp(recovery_lr_frac, final_lr_frac, phase_mix(progress, SWITCHBACK_RECAP_END, 1.0))
-    if group["kind"] == "muon" and group["shape_class"] == "square":
+    if kind == "muon" and group["shape_class"] == "square":
         base *= get_square_muon_pulse_scale(progress)
-    if group["subkind"] in ("token_embed", "value_embed"):
-        base *= get_embed_cool_scale(group["subkind"], progress)
-    if group["kind"] == "adamw" and group["subkind"] in ("resid", "x0"):
-        return base * get_scalar_quiet_scale(group["subkind"], progress)
+    if subkind in ("token_embed", "value_embed"):
+        base *= get_embed_cool_scale(subkind, progress)
+    if kind == "adamw" and subkind in ("resid", "x0"):
+        return base * get_scalar_quiet_scale(subkind, progress)
     return base
 
 def get_muon_momentum(step, progress, shape_class):

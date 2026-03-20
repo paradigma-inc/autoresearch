@@ -518,7 +518,8 @@ MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-# Keep the early 039 schedule, then add a staged Muon reset ladder and a cautious tail rebound.
+# Anti-phase optimizer handoff: keep geometry-side banks hot later, cool output-side banks earlier,
+# and use the existing reset ladder as the background scaffold.
 SWITCHBACK_RECAP_START = 0.68
 SWITCHBACK_RECAP_END = 0.84
 SQUARE_RESET_START = 0.44
@@ -769,13 +770,6 @@ def get_muon_switchback_lr_profile(shape_class):
     if shape_class == 'square':
         return 0.98, 0.54, 0.72, get_muon_final_lr_frac(shape_class)
     return 0.92, 0.60, 0.74, get_muon_final_lr_frac(shape_class)
-
-def get_square_muon_pulse_scale(progress):
-    if progress < SQUARE_MUON_PULSE_START or progress > SQUARE_MUON_PULSE_END:
-        return 1.0
-    return 1.0 + SQUARE_MUON_PULSE_BOOST * cosine_bell(
-        progress, SQUARE_MUON_PULSE_START, SQUARE_MUON_PULSE_PEAK, SQUARE_MUON_PULSE_END
-    )
 
 def get_group_lr_multiplier(group, progress):
     kind = group["kind"]

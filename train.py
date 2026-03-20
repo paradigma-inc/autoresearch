@@ -445,12 +445,19 @@ ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.125   # probe whether pushing above the 10% winner still helps
-ADAM_FINAL_LR_FRAC = 0.05 # cool Adam-managed groups more aggressively late
-MUON_FINAL_LR_FRAC = 0.20 # keep matrix weights hotter late than the rest
-MUON_RELEASE_START = 0.75
-MUON_FINAL_MOMENTUM = 0.91
-MUON_BETA2_RELEASE_START = 0.70
-MUON_FINAL_BETA2 = 0.90
+ADAM_FINAL_LR_FRAC = 0.02 # keep Adam-managed groups very cold in the last third
+MUON_FINAL_LR_FRAC = 0.18 # slightly cooler floor than Attempt 029 before the pulse
+AFTERBURNER_START = 0.80
+AFTERBURNER_END = 0.94
+AFTERBURNER_BUMP = 0.12
+MUON_RELEASE_START = 0.82
+MUON_FINAL_MOMENTUM = 0.90
+MUON_BETA2_RELEASE_START = 0.80
+MUON_FINAL_BETA2 = 0.88
+DECAY_REBOUND_START = 0.82
+DECAY_REBOUND_END = 0.97
+DECAY_REBOUND_FRAC = 0.55
+MIN_WEIGHT_DECAY_FRAC = 0.10
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -532,13 +539,17 @@ def get_lr_multiplier(progress):
 
 def get_group_lr_multiplier(kind, progress):
     if progress < WARMUP_RATIO:
-        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
+        base = progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
     elif progress < 1.0 - WARMDOWN_RATIO:
-        return 1.0
+        base = 1.0
     else:
         cooldown = (1.0 - progress) / WARMDOWN_RATIO
         final_lr_frac = MUON_FINAL_LR_FRAC if kind == 'muon' else ADAM_FINAL_LR_FRAC
-        return cooldown * 1.0 + (1 - cooldown) * final_lr_frac
+        base = cooldown * 1.0 + (1 - cooldown) * final_lr_frac
+    if kind == 'muon' and AFTERBURNER_START <= progress <= AFTERBURNER_END:
+        phase = (progress - AFTERBURNER_START) / (AFTERBURNER_END - AFTERBURNER_START)
+        base += AFTERBURNER_BUMP * math.sin(math.pi * phase)
+    return base
 
 def get_muon_momentum(step, progress):
     frac = min(step / 300, 1)
@@ -555,7 +566,11 @@ def get_muon_beta2(progress):
     return 0.95 * (1.0 - tail_progress) + MUON_FINAL_BETA2 * tail_progress
 
 def get_weight_decay(progress):
-    return WEIGHT_DECAY * (1 - progress)
+    base = max(WEIGHT_DECAY * MIN_WEIGHT_DECAY_FRAC, WEIGHT_DECAY * (1 - progress))
+    if DECAY_REBOUND_START <= progress <= DECAY_REBOUND_END:
+        phase = (progress - DECAY_REBOUND_START) / (DECAY_REBOUND_END - DECAY_REBOUND_START)
+        base += WEIGHT_DECAY * DECAY_REBOUND_FRAC * math.sin(math.pi * phase)
+    return base
 
 # ---------------------------------------------------------------------------
 # Training loop

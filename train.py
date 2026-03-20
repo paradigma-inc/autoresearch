@@ -445,12 +445,16 @@ ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.125   # probe whether pushing above the 10% winner still helps
-ADAM_FINAL_LR_FRAC = 0.05 # cool Adam-managed groups more aggressively late
-MUON_FINAL_LR_FRAC = 0.20 # keep matrix weights hotter late than the rest
-MUON_RELEASE_START = 0.75
-MUON_FINAL_MOMENTUM = 0.91
-MUON_BETA2_RELEASE_START = 0.70
-MUON_FINAL_BETA2 = 0.90
+ADAM_FINAL_LR_FRAC = 0.03 # freeze Adam-managed groups a bit harder than Attempt 029
+MUON_FINAL_LR_FRAC = 0.24 # keep matrix weights slightly hotter through the tail
+MUON_VALLEY_START = 0.72
+MUON_VALLEY_BOTTOM = 0.90
+MUON_VALLEY_END = 0.98
+MUON_VALLEY_MOMENTUM = 0.87
+MUON_RECOVERY_MOMENTUM = 0.93
+MUON_VALLEY_BETA2 = 0.82
+MUON_RECOVERY_BETA2 = 0.93
+MIN_WEIGHT_DECAY_FRAC = 0.20
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -543,19 +547,29 @@ def get_group_lr_multiplier(kind, progress):
 def get_muon_momentum(step, progress):
     frac = min(step / 300, 1)
     base_momentum = (1 - frac) * 0.85 + frac * 0.95
-    if progress < MUON_RELEASE_START:
+    if progress < MUON_VALLEY_START:
         return base_momentum
-    tail_progress = (progress - MUON_RELEASE_START) / (1.0 - MUON_RELEASE_START)
-    return base_momentum * (1.0 - tail_progress) + MUON_FINAL_MOMENTUM * tail_progress
+    if progress < MUON_VALLEY_BOTTOM:
+        phase = (progress - MUON_VALLEY_START) / (MUON_VALLEY_BOTTOM - MUON_VALLEY_START)
+        return base_momentum + (MUON_VALLEY_MOMENTUM - base_momentum) * phase
+    if progress < MUON_VALLEY_END:
+        phase = (progress - MUON_VALLEY_BOTTOM) / (MUON_VALLEY_END - MUON_VALLEY_BOTTOM)
+        return MUON_VALLEY_MOMENTUM + (MUON_RECOVERY_MOMENTUM - MUON_VALLEY_MOMENTUM) * phase
+    return MUON_RECOVERY_MOMENTUM
 
 def get_muon_beta2(progress):
-    if progress < MUON_BETA2_RELEASE_START:
+    if progress < MUON_VALLEY_START:
         return 0.95
-    tail_progress = (progress - MUON_BETA2_RELEASE_START) / (1.0 - MUON_BETA2_RELEASE_START)
-    return 0.95 * (1.0 - tail_progress) + MUON_FINAL_BETA2 * tail_progress
+    if progress < MUON_VALLEY_BOTTOM:
+        phase = (progress - MUON_VALLEY_START) / (MUON_VALLEY_BOTTOM - MUON_VALLEY_START)
+        return 0.95 + (MUON_VALLEY_BETA2 - 0.95) * phase
+    if progress < MUON_VALLEY_END:
+        phase = (progress - MUON_VALLEY_BOTTOM) / (MUON_VALLEY_END - MUON_VALLEY_BOTTOM)
+        return MUON_VALLEY_BETA2 + (MUON_RECOVERY_BETA2 - MUON_VALLEY_BETA2) * phase
+    return MUON_RECOVERY_BETA2
 
 def get_weight_decay(progress):
-    return WEIGHT_DECAY * (1 - progress)
+    return max(WEIGHT_DECAY * MIN_WEIGHT_DECAY_FRAC, WEIGHT_DECAY * (1 - progress))
 
 # ---------------------------------------------------------------------------
 # Training loop

@@ -373,6 +373,23 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._schedule_progress = 0.0
+
+    def set_schedule_progress(self, progress):
+        self._schedule_progress = progress
+
+    def _apply_reset_ladder(self, group, state):
+        progress = self._schedule_progress
+        if group["shape_class"] == "square":
+            if state.get("reset_ladder_stage", 0) < 1 and progress >= SQUARE_RESET_START:
+                state["momentum_buffer"].mul_(SQUARE_MUON_MOMENTUM_SHRINK)
+                state["second_momentum_buffer"].mul_(SQUARE_MUON_SECOND_SHRINK)
+                state["reset_ladder_stage"] = 1
+        else:
+            if state.get("reset_ladder_stage", 0) < 2 and progress >= RECT_RESET_START:
+                state["momentum_buffer"].mul_(RECT_MUON_MOMENTUM_SHRINK)
+                state["second_momentum_buffer"].mul_(RECT_MUON_SECOND_SHRINK)
+                state["reset_ladder_stage"] = 2
 
     def _step_adamw(self, group):
         for p in group['params']:
@@ -408,6 +425,7 @@ class MuonAdamW(torch.optim.Optimizer):
         if "second_momentum_buffer" not in state:
             state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
+        self._apply_reset_ladder(group, state)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
         stacked_grads = torch.stack([p.grad for p in params])
         stacked_params = torch.stack(params)
@@ -446,9 +464,29 @@ MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-# Three-phase switchback: Muon-heavy explore -> short Adam recap -> Muon-biased finish.
+# Keep the early 039 schedule, then add a staged Muon reset ladder and a cautious tail rebound.
 SWITCHBACK_RECAP_START = 0.68
 SWITCHBACK_RECAP_END = 0.84
+SQUARE_RESET_START = 0.44
+SQUARE_RESET_PEAK = 0.47
+SQUARE_RESET_END = 0.50
+RECT_RESET_START = 0.62
+RECT_RESET_PEAK = 0.66
+RECT_RESET_END = 0.70
+SQUARE_MUON_MOMENTUM_SHRINK = 0.42
+SQUARE_MUON_SECOND_SHRINK = 0.60
+RECT_MUON_MOMENTUM_SHRINK = 0.72
+RECT_MUON_SECOND_SHRINK = 0.84
+SCALAR_QUIET_1_START = 0.43
+SCALAR_QUIET_1_PEAK = 0.47
+SCALAR_QUIET_1_END = 0.52
+SCALAR_QUIET_2_START = 0.60
+SCALAR_QUIET_2_PEAK = 0.66
+SCALAR_QUIET_2_END = 0.70
+RESID_QUIET_1_FLOOR = 0.00
+RESID_QUIET_2_FLOOR = 0.18
+X0_QUIET_1_FLOOR = 0.10
+X0_QUIET_2_FLOOR = 0.28
 FINAL_LR_FRAC = 0.125   # fallback final LR fraction for uncategorized Adam groups
 HEAD_FINAL_LR_FRAC = 0.08
 TOKEN_EMBED_FINAL_LR_FRAC = 0.03
@@ -461,6 +499,11 @@ MUON_SQUARE_FINAL_MOMENTUM = 0.90
 MUON_RECT_FINAL_MOMENTUM = 0.93
 MUON_SQUARE_FINAL_BETA2 = 0.89
 MUON_RECT_FINAL_BETA2 = 0.92
+WEIGHT_DECAY_FLOOR = 0.04
+WEIGHT_DECAY_REBOUND = 0.06
+WEIGHT_DECAY_REBOUND_START = 0.76
+WEIGHT_DECAY_REBOUND_PEAK = 0.90
+WEIGHT_DECAY_REBOUND_END = 1.00
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -539,6 +582,16 @@ def phase_mix(progress, start, end):
         return 1.0
     return max(0.0, min(1.0, (progress - start) / (end - start)))
 
+def cosine_bell(progress, start, peak, end):
+    if progress <= start or progress >= end:
+        return 0.0
+    if progress <= peak:
+        return 0.5 * (1.0 - math.cos(math.pi * phase_mix(progress, start, peak)))
+    return 0.5 * (1.0 + math.cos(math.pi * phase_mix(progress, peak, end)))
+
+def quiet_window_scale(progress, start, peak, end, floor):
+    return lerp(1.0, floor, cosine_bell(progress, start, peak, end))
+
 def get_adam_final_lr_frac(subkind):
     if subkind == 'lm_head':
         return HEAD_FINAL_LR_FRAC
@@ -556,6 +609,17 @@ def get_muon_final_lr_frac(shape_class):
     if shape_class == 'square':
         return MUON_SQUARE_FINAL_LR_FRAC
     return MUON_RECT_FINAL_LR_FRAC
+
+def get_scalar_quiet_scale(subkind, progress):
+    quiet_1 = quiet_window_scale(
+        progress, SCALAR_QUIET_1_START, SCALAR_QUIET_1_PEAK, SCALAR_QUIET_1_END,
+        RESID_QUIET_1_FLOOR if subkind == 'resid' else X0_QUIET_1_FLOOR,
+    )
+    quiet_2 = quiet_window_scale(
+        progress, SCALAR_QUIET_2_START, SCALAR_QUIET_2_PEAK, SCALAR_QUIET_2_END,
+        RESID_QUIET_2_FLOOR if subkind == 'resid' else X0_QUIET_2_FLOOR,
+    )
+    return min(quiet_1, quiet_2)
 
 def get_adam_switchback_lr_profile(subkind):
     if subkind == 'lm_head':
@@ -582,10 +646,14 @@ def get_group_lr_multiplier(group, progress):
         start_lr_frac, recap_lr_frac, recovery_lr_frac, final_lr_frac = get_adam_switchback_lr_profile(group['subkind'])
 
     if progress < SWITCHBACK_RECAP_START:
-        return lerp(start_lr_frac, recap_lr_frac, phase_mix(progress, 0.0, SWITCHBACK_RECAP_START))
-    if progress < SWITCHBACK_RECAP_END:
-        return lerp(recap_lr_frac, recovery_lr_frac, phase_mix(progress, SWITCHBACK_RECAP_START, SWITCHBACK_RECAP_END))
-    return lerp(recovery_lr_frac, final_lr_frac, phase_mix(progress, SWITCHBACK_RECAP_END, 1.0))
+        base = lerp(start_lr_frac, recap_lr_frac, phase_mix(progress, 0.0, SWITCHBACK_RECAP_START))
+    elif progress < SWITCHBACK_RECAP_END:
+        base = lerp(recap_lr_frac, recovery_lr_frac, phase_mix(progress, SWITCHBACK_RECAP_START, SWITCHBACK_RECAP_END))
+    else:
+        base = lerp(recovery_lr_frac, final_lr_frac, phase_mix(progress, SWITCHBACK_RECAP_END, 1.0))
+    if group["kind"] == "adamw" and group["subkind"] in ("resid", "x0"):
+        return base * get_scalar_quiet_scale(group["subkind"], progress)
+    return base
 
 def get_muon_momentum(step, progress, shape_class):
     warm_momentum = lerp(0.86, 0.95, min(step / 300, 1))
@@ -605,7 +673,11 @@ def get_muon_beta2(progress, shape_class):
     return lerp(0.91, final_beta2, phase_mix(progress, SWITCHBACK_RECAP_END, 1.0))
 
 def get_weight_decay(progress):
-    return WEIGHT_DECAY * (1 - progress)
+    base = lerp(WEIGHT_DECAY, WEIGHT_DECAY_FLOOR, phase_mix(progress, 0.0, WEIGHT_DECAY_REBOUND_START))
+    rebound = WEIGHT_DECAY_REBOUND * cosine_bell(
+        progress, WEIGHT_DECAY_REBOUND_START, WEIGHT_DECAY_REBOUND_PEAK, WEIGHT_DECAY_REBOUND_END
+    )
+    return base + rebound
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -631,6 +703,7 @@ while True:
     progress = min(total_training_time / TIME_BUDGET, 1.0)
     muon_weight_decay = get_weight_decay(progress)
     report_lrm = None
+    optimizer.set_schedule_progress(progress)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * get_group_lr_multiplier(group, progress)
         if group['kind'] == 'muon':

@@ -258,7 +258,7 @@ class GPT(nn.Module):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+                momentum=0.95, ns_steps=MUON_BASE_NS_STEPS, beta2=0.95, weight_decay=weight_decay,
             ))
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
@@ -445,20 +445,18 @@ ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.125   # probe whether pushing above the 10% winner still helps
-ADAM_FREEZE_START = 0.76
-ADAM_FROZEN_LR_FRAC = 0.02
-MUON_PLATEAU_START = 0.72
-MUON_PLATEAU_END = 0.90
-MUON_PLATEAU_LR_FRAC = 0.30
-MUON_FINAL_LR_FRAC = 0.10
-MUON_RELEASE_START = 0.80
-MUON_VALLEY_MOMENTUM = 0.88
-MUON_RECOVERY_MOMENTUM = 0.92
-MUON_BETA2_DROP_START = 0.76
-MUON_BETA2_RECOVER_START = 0.92
-MUON_VALLEY_BETA2 = 0.88
-MUON_RECOVERY_BETA2 = 0.91
-MIN_WEIGHT_DECAY_FRAC = 0.30
+ADAM_FREEZE_START = 0.55
+ADAM_FREEZE_END = 0.82
+ADAM_FREEZE_FLOOR = 0.02
+MUON_TAIL_START = 0.50
+MUON_FINAL_LR_FRAC = 0.26
+MUON_RELEASE_START = 0.82
+MUON_FINAL_MOMENTUM = 0.90
+MUON_BETA2_RELEASE_START = 0.78
+MUON_FINAL_BETA2 = 0.89
+MUON_BASE_NS_STEPS = 4
+MUON_NS_PUSH_START = 0.92
+MUON_FINAL_NS_STEPS = 5
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -538,47 +536,42 @@ def get_lr_multiplier(progress):
         cooldown = (1.0 - progress) / WARMDOWN_RATIO
         return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
 
+def ramp_value(progress, start, end, start_value, end_value):
+    if progress <= start:
+        return start_value
+    if progress >= end:
+        return end_value
+    frac = (progress - start) / (end - start)
+    return start_value * (1.0 - frac) + end_value * frac
+
 def get_group_lr_multiplier(kind, progress):
-    tail_start = 1.0 - WARMDOWN_RATIO
     if progress < WARMUP_RATIO:
-        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
-    elif progress < tail_start:
-        return 1.0
+        base = progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
+    else:
+        base = 1.0
     if kind == 'muon':
-        if progress < MUON_PLATEAU_START:
-            phase = (progress - tail_start) / (MUON_PLATEAU_START - tail_start)
-            return 1.0 + (MUON_PLATEAU_LR_FRAC - 1.0) * phase
-        if progress < MUON_PLATEAU_END:
-            return MUON_PLATEAU_LR_FRAC
-        phase = (progress - MUON_PLATEAU_END) / (1.0 - MUON_PLATEAU_END)
-        return MUON_PLATEAU_LR_FRAC + (MUON_FINAL_LR_FRAC - MUON_PLATEAU_LR_FRAC) * phase
-    if progress < ADAM_FREEZE_START:
-        phase = (progress - tail_start) / (ADAM_FREEZE_START - tail_start)
-        return 1.0 + (ADAM_FROZEN_LR_FRAC - 1.0) * phase
-    return ADAM_FROZEN_LR_FRAC
+        return base * ramp_value(progress, MUON_TAIL_START, 1.0, 1.0, MUON_FINAL_LR_FRAC)
+    return base * ramp_value(progress, ADAM_FREEZE_START, ADAM_FREEZE_END, 1.0, ADAM_FREEZE_FLOOR)
 
 def get_muon_momentum(step, progress):
     frac = min(step / 300, 1)
     base_momentum = (1 - frac) * 0.85 + frac * 0.95
     if progress < MUON_RELEASE_START:
         return base_momentum
-    if progress < MUON_PLATEAU_END:
-        phase = (progress - MUON_RELEASE_START) / (MUON_PLATEAU_END - MUON_RELEASE_START)
-        return base_momentum + (MUON_VALLEY_MOMENTUM - base_momentum) * phase
-    phase = (progress - MUON_PLATEAU_END) / (1.0 - MUON_PLATEAU_END)
-    return MUON_VALLEY_MOMENTUM + (MUON_RECOVERY_MOMENTUM - MUON_VALLEY_MOMENTUM) * phase
+    return ramp_value(progress, MUON_RELEASE_START, 1.0, base_momentum, MUON_FINAL_MOMENTUM)
 
 def get_muon_beta2(progress):
-    if progress < MUON_BETA2_DROP_START:
+    if progress < MUON_BETA2_RELEASE_START:
         return 0.95
-    if progress < MUON_BETA2_RECOVER_START:
-        phase = (progress - MUON_BETA2_DROP_START) / (MUON_BETA2_RECOVER_START - MUON_BETA2_DROP_START)
-        return 0.95 + (MUON_VALLEY_BETA2 - 0.95) * phase
-    phase = (progress - MUON_BETA2_RECOVER_START) / (1.0 - MUON_BETA2_RECOVER_START)
-    return MUON_VALLEY_BETA2 + (MUON_RECOVERY_BETA2 - MUON_VALLEY_BETA2) * phase
+    return ramp_value(progress, MUON_BETA2_RELEASE_START, 1.0, 0.95, MUON_FINAL_BETA2)
+
+def get_muon_ns_steps(progress):
+    if progress < MUON_NS_PUSH_START:
+        return MUON_BASE_NS_STEPS
+    return MUON_FINAL_NS_STEPS
 
 def get_weight_decay(progress):
-    return max(WEIGHT_DECAY * MIN_WEIGHT_DECAY_FRAC, WEIGHT_DECAY * (1 - progress))
+    return WEIGHT_DECAY * (1 - progress)
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -605,12 +598,14 @@ while True:
     report_lrm = get_group_lr_multiplier('muon', progress)
     muon_momentum = get_muon_momentum(step, progress)
     muon_beta2 = get_muon_beta2(progress)
+    muon_ns_steps = get_muon_ns_steps(progress)
     muon_weight_decay = get_weight_decay(progress)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * get_group_lr_multiplier(group["kind"], progress)
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
             group["beta2"] = muon_beta2
+            group["ns_steps"] = muon_ns_steps
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
     model.zero_grad(set_to_none=True)

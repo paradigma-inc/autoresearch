@@ -661,6 +661,18 @@ VALUE_EMBED_LATE_HEAT_BOOST = 0.10
 GEOMETRY_MUON_HEAT_START = 0.58
 GEOMETRY_MUON_RECT_BOOST = 0.05
 GEOMETRY_MUON_SQUARE_BOOST = 0.08
+MUON_ALPHA_EARLY_RAW = 0.49
+RECT_MUON_ALPHA_EARLY_RAW = 0.48
+MUON_ALPHA_EARLY_SETTLE_END = 0.22
+RECT_MUON_ALPHA_EARLY_SETTLE_END = 0.28
+RECT_MUON_ALPHA_RECAP_START = SWITCHBACK_RECAP_START + 0.04
+RECT_MUON_ALPHA_RECAP_PEAK = SWITCHBACK_RECAP_START + 0.08
+RECT_MUON_ALPHA_RECAP_END = SWITCHBACK_RECAP_END - 0.02
+RECT_MUON_ALPHA_RECAP_FLOOR = 0.45
+RECT_MUON_RECAP_LR_DIP_START = RECT_MUON_ALPHA_RECAP_START
+RECT_MUON_RECAP_LR_DIP_PEAK = RECT_MUON_ALPHA_RECAP_PEAK
+RECT_MUON_RECAP_LR_DIP_END = RECT_MUON_ALPHA_RECAP_END
+RECT_MUON_RECAP_LR_DIP_FLOOR = 0.84
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -853,7 +865,10 @@ def get_group_lr_multiplier(group, progress):
     else:
         base = lerp(recovery_lr_frac, final_lr_frac, phase_mix(progress, SWITCHBACK_RECAP_END, 1.0))
     if kind == "muon" or subkind == "value_embed":
-        return base * get_geometry_bank_scale(group, progress)
+        lr_scale = get_geometry_bank_scale(group, progress)
+        if kind == "muon":
+            lr_scale *= get_muon_recap_pulse_scale(group["shape_class"], progress)
+        return base * lr_scale
     if kind == "adamw" and subkind in ("lm_head", "token_embed", "resid", "x0"):
         return base * get_output_handoff_scale(subkind, progress)
     return base
@@ -874,6 +889,27 @@ def get_muon_beta2(progress, shape_class):
         return lerp(0.95, 0.91, phase_mix(progress, SWITCHBACK_RECAP_START, SWITCHBACK_RECAP_END))
     final_beta2 = MUON_SQUARE_FINAL_BETA2 if shape_class == 'square' else MUON_RECT_FINAL_BETA2
     return lerp(0.91, final_beta2, phase_mix(progress, SWITCHBACK_RECAP_END, 1.0))
+
+def get_muon_recap_pulse_scale(shape_class, progress):
+    if shape_class != "rect":
+        return 1.0
+    return lerp(
+        1.0,
+        RECT_MUON_RECAP_LR_DIP_FLOOR,
+        cosine_bell(progress, RECT_MUON_RECAP_LR_DIP_START, RECT_MUON_RECAP_LR_DIP_PEAK, RECT_MUON_RECAP_LR_DIP_END),
+    )
+
+def get_muon_alpha(progress, shape_class):
+    if shape_class == "rect":
+        if progress < RECT_MUON_ALPHA_EARLY_SETTLE_END:
+            return lerp(RECT_MUON_ALPHA_EARLY_RAW, 0.50, phase_mix(progress, 0.0, RECT_MUON_ALPHA_EARLY_SETTLE_END))
+        if RECT_MUON_ALPHA_RECAP_START <= progress < RECT_MUON_ALPHA_RECAP_END:
+            return lerp(0.50, RECT_MUON_ALPHA_RECAP_FLOOR,
+                        cosine_bell(progress, RECT_MUON_ALPHA_RECAP_START, RECT_MUON_ALPHA_RECAP_PEAK, RECT_MUON_ALPHA_RECAP_END))
+        return 0.50
+    if progress < MUON_ALPHA_EARLY_SETTLE_END:
+        return lerp(MUON_ALPHA_EARLY_RAW, 0.50, phase_mix(progress, 0.0, MUON_ALPHA_EARLY_SETTLE_END))
+    return 0.50
 
 def get_weight_decay(progress):
     base = lerp(WEIGHT_DECAY, WEIGHT_DECAY_FLOOR, phase_mix(progress, 0.0, WEIGHT_DECAY_REBOUND_START))
@@ -917,18 +953,32 @@ while True:
 
     # Progress and schedules
     muon_weight_decay = get_weight_decay(progress)
-    report_lrm = None
+    report_lrm_square = None
+    report_lrm_rect = None
+    report_alpha_square = None
+    report_alpha_rect = None
     optimizer.set_schedule_progress(progress)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * get_group_lr_multiplier(group, progress)
         if group['kind'] == 'muon':
+            group["alpha"] = get_muon_alpha(progress, group["shape_class"])
             group["momentum"] = get_muon_momentum(step, progress, group["shape_class"])
             group["beta2"] = get_muon_beta2(progress, group["shape_class"])
             group["weight_decay"] = muon_weight_decay
-            if report_lrm is None and group["shape_class"] == "square":
-                report_lrm = group["lr"] / group["initial_lr"]
-    if report_lrm is None:
-        report_lrm = 0.0
+            if group["shape_class"] == "square" and report_lrm_square is None:
+                report_lrm_square = group["lr"] / group["initial_lr"]
+                report_alpha_square = group["alpha"]
+            if group["shape_class"] == "rect" and report_lrm_rect is None:
+                report_lrm_rect = group["lr"] / group["initial_lr"]
+                report_alpha_rect = group["alpha"]
+    if report_lrm_square is None:
+        report_lrm_square = 0.0
+    if report_lrm_rect is None:
+        report_lrm_rect = 0.0
+    if report_alpha_square is None:
+        report_alpha_square = 0.0
+    if report_alpha_rect is None:
+        report_alpha_rect = 0.0
     optimizer.step()
     model.zero_grad(set_to_none=True)
 
@@ -957,7 +1007,15 @@ while True:
     mfu = 100 * num_flops_per_token * current_total_batch_size / dt / H100_BF16_PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {report_lrm:.2f} | accum: {current_grad_accum_steps} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    print(
+        f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} "
+        f"| lrm: sq={report_lrm_square:.2f} rect={report_lrm_rect:.2f} "
+        f"| alpha: sq={report_alpha_square:.2f} rect={report_alpha_rect:.2f} "
+        f"| accum: {current_grad_accum_steps} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} "
+        f"| mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ",
+        end="",
+        flush=True,
+    )
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:

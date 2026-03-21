@@ -691,14 +691,14 @@ VALUE_EMBED_LATE_HEAT_BOOST = 0.10
 GEOMETRY_MUON_HEAT_START = 0.58
 GEOMETRY_MUON_RECT_BOOST = 0.05
 GEOMETRY_MUON_SQUARE_BOOST = 0.08
-RECT_ALPHA_EARLY = 0.44
-RECT_ALPHA_MID = 0.47
-RECT_ALPHA_RECAP = 0.50
-RECT_ALPHA_TAIL = 0.52
-SQUARE_ALPHA_EARLY = 0.48
-SQUARE_ALPHA_MID = 0.50
-SQUARE_ALPHA_RECAP = 0.52
-SQUARE_ALPHA_TAIL = 0.54
+RECT_ALPHA_BASE = 0.50
+RECT_ALPHA_DIP = 0.44
+RECT_ALPHA_DIP_START = 0.56
+RECT_ALPHA_DIP_END = 0.84
+SQUARE_ALPHA_BASE = 0.50
+SQUARE_ALPHA_DIP = 0.46
+SQUARE_ALPHA_DIP_START = 0.60
+SQUARE_ALPHA_DIP_END = 0.88
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -915,20 +915,12 @@ def get_muon_beta2(progress, shape_class):
 
 def get_muon_alpha(progress, shape_class):
     if shape_class == "rect":
-        if progress < GEOMETRY_MUON_HEAT_START:
-            return RECT_ALPHA_EARLY
-        if progress < SWITCHBACK_RECAP_END:
-            return RECT_ALPHA_MID
-        if progress < FRESHNESS_RECT_MUON_START:
-            return RECT_ALPHA_RECAP
-        return RECT_ALPHA_TAIL
-    if progress < SWITCHBACK_RECAP_START:
-        return SQUARE_ALPHA_EARLY
-    if progress < FRESHNESS_RECT_MUON_START:
-        return SQUARE_ALPHA_MID
-    if progress < FRESHNESS_SQUARE_MUON_START:
-        return SQUARE_ALPHA_RECAP
-    return SQUARE_ALPHA_TAIL
+        if RECT_ALPHA_DIP_START <= progress < RECT_ALPHA_DIP_END:
+            return RECT_ALPHA_DIP
+        return RECT_ALPHA_BASE
+    if SQUARE_ALPHA_DIP_START <= progress < SQUARE_ALPHA_DIP_END:
+        return SQUARE_ALPHA_DIP
+    return SQUARE_ALPHA_BASE
 
 def get_weight_decay(progress):
     base = lerp(WEIGHT_DECAY, WEIGHT_DECAY_FLOOR, phase_mix(progress, 0.0, WEIGHT_DECAY_REBOUND_START))

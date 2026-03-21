@@ -272,7 +272,7 @@ class GPT(nn.Module):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
                 kind='muon', shape_class=classify_shape(shape), params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay, alpha=0.50,
             ))
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
@@ -308,13 +308,44 @@ class GPT(nn.Module):
 # Optimizer (MuonAdamW, single GPU only)
 # ---------------------------------------------------------------------------
 
-polar_express_coeffs = [
-    (8.156554524902461, -22.48329292557795, 15.878769915207462),
-    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
-    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
-    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
-    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
-]
+SCHEDULED_MUON_POLY_DEGREE = 3
+SCHEDULED_MUON_POLY_EPS = 1e-3
+
+
+def build_poly_coeffs(alpha, degree=SCHEDULED_MUON_POLY_DEGREE, eps=SCHEDULED_MUON_POLY_EPS, n_points=256, device="cpu"):
+    xs = torch.linspace(eps, 1.0, n_points, dtype=torch.float64)
+    ys = xs.pow(-alpha)
+    vander = torch.vander(xs, N=degree + 1)
+    coeffs = torch.linalg.lstsq(vander, ys.unsqueeze(-1)).solution.squeeze(-1)
+    return coeffs.to(dtype=torch.float32, device=device)
+
+
+def poly_matrix_batched(a, coeffs):
+    n = a.shape[-1]
+    eye = torch.eye(n, device=a.device, dtype=a.dtype)
+    p = torch.zeros_like(a)
+    for c in coeffs.to(device=a.device, dtype=a.dtype):
+        p = p @ a + c * eye
+    return p
+
+
+def apply_power_preconditioner_poly(g, coeffs, alpha_t):
+    x = g.bfloat16()
+    if g.size(-2) >= g.size(-1):
+        a = x.mT @ x
+        s = a.float().norm(dim=(-2, -1), keepdim=True).to(a.dtype)
+        a_tilde = a / (s + 1e-7)
+        p = poly_matrix_batched(a_tilde, coeffs)
+        g_poly = x @ p
+    else:
+        a = x @ x.mT
+        s = a.float().norm(dim=(-2, -1), keepdim=True).to(a.dtype)
+        a_tilde = a / (s + 1e-7)
+        p = poly_matrix_batched(a_tilde, coeffs)
+        g_poly = p @ x
+    alpha = alpha_t.to(dtype=torch.float32, device=s.device)
+    scale = torch.exp(-alpha * torch.log(s.float() + 1e-7)).to(g_poly.dtype)
+    return (g_poly * scale).to(g.dtype)
 
 @torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
@@ -329,25 +360,12 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
 
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
-                    momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
+                    momentum_t, lr_t, wd_t, beta2_t, coeffs, alpha_t, red_dim):
     # Nesterov momentum
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
-    # Polar express orthogonalization
-    X = g.bfloat16()
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
-    if g.size(-2) > g.size(-1):
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X.mT @ X
-            B = b * A + c * (A @ A)
-            X = a * X + X @ B
-    else:
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X @ X.mT
-            B = b * A + c * (A @ A)
-            X = a * X + B @ X
-    g = X
+    g = apply_power_preconditioner_poly(g, coeffs, alpha_t)
     # NorMuon variance reduction
     beta2 = beta2_t.to(g.dtype)
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
@@ -383,7 +401,9 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_alpha_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._schedule_progress = 0.0
+        self._poly_coeff_cache = {}
         self._freshness_adam_applied = False
         self._freshness_rect_applied = False
         self._freshness_square_applied = False
@@ -391,6 +411,14 @@ class MuonAdamW(torch.optim.Optimizer):
 
     def set_schedule_progress(self, progress):
         self._schedule_progress = progress
+
+    def _get_poly_coeffs(self, alpha, device):
+        key = (round(alpha, 4), str(device))
+        coeffs = self._poly_coeff_cache.get(key)
+        if coeffs is None:
+            coeffs = build_poly_coeffs(alpha, device=device)
+            self._poly_coeff_cache[key] = coeffs
+        return coeffs
 
     def _apply_reset_ladder(self, group, state):
         progress = self._schedule_progress
@@ -539,14 +567,16 @@ class MuonAdamW(torch.optim.Optimizer):
         red_dim = -1 if shape[-2] >= shape[-1] else -2
         stacked_grads = torch.stack([p.grad for p in params])
         stacked_params = torch.stack(params)
+        coeffs = self._get_poly_coeffs(group["alpha"], device)
         self._muon_momentum_t.fill_(group["momentum"])
         self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
         self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
         self._muon_wd_t.fill_(group["weight_decay"])
+        self._muon_alpha_t.fill_(group["alpha"])
         muon_step_fused(stacked_grads, stacked_params,
                         state["momentum_buffer"], state["second_momentum_buffer"],
                         self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
-                        self._muon_beta2_t, group["ns_steps"], red_dim)
+                        self._muon_beta2_t, coeffs, self._muon_alpha_t, red_dim)
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
     @torch.no_grad()

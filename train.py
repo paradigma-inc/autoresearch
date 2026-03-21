@@ -316,6 +316,87 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
+def rre_extrapolate(iterates, regularization=1e-6):
+    k = len(iterates) - 1
+    if k < 2:
+        return iterates[-1].clone()
+
+    orig_dtype = iterates[0].dtype
+    iterates_f32 = [x.float() for x in iterates]
+    diffs = [iterates_f32[i + 1] - iterates_f32[i] for i in range(k)]
+    U = torch.stack(diffs)
+    G = U @ U.T
+    reg = regularization * torch.trace(G) / k + 1e-10
+    G = G + reg * torch.eye(k, device=G.device, dtype=G.dtype)
+    ones = torch.ones(k, dtype=G.dtype, device=G.device)
+
+    try:
+        c = torch.linalg.solve(G, ones)
+        c = c / c.sum()
+    except Exception:
+        return iterates[-1].clone()
+
+    gamma = torch.flip(torch.cumsum(torch.flip(c, [0]), 0), [0])
+    x_star = iterates_f32[-1] - (gamma @ U)
+    return x_star.to(orig_dtype)
+
+
+class LateMuonRRE:
+    def __init__(self, muon_params, extrap_every, num_checkpoints, late_start_progress,
+                 reset_state_after_extrap=True, per_layer=False, regularization=1e-6):
+        self.muon_params = list(muon_params)
+        self.extrap_every = extrap_every
+        self.num_checkpoints = num_checkpoints
+        self.late_start_progress = late_start_progress
+        self.reset_state_after_extrap = reset_state_after_extrap
+        self.per_layer = per_layer
+        self.regularization = regularization
+        self.checkpoints = [[] for _ in self.muon_params] if self.per_layer else []
+
+    def _flatten_params(self):
+        return torch.cat([p.data.flatten() for p in self.muon_params])
+
+    def _unflatten_params(self, flat_params):
+        offset = 0
+        for p in self.muon_params:
+            numel = p.numel()
+            p.data.copy_(flat_params[offset:offset + numel].view_as(p))
+            offset += numel
+
+    @torch.no_grad()
+    def maybe_step(self, step, progress, optimizer):
+        if self.per_layer:
+            for i, p in enumerate(self.muon_params):
+                self.checkpoints[i].append(p.data.flatten().detach().clone())
+                if len(self.checkpoints[i]) > self.num_checkpoints:
+                    self.checkpoints[i].pop(0)
+            if progress < self.late_start_progress:
+                return False
+            if step % self.extrap_every != 0 or len(self.checkpoints[0]) < self.num_checkpoints:
+                return False
+            for i, p in enumerate(self.muon_params):
+                extrapolated = rre_extrapolate(self.checkpoints[i], regularization=self.regularization)
+                p.data.copy_(extrapolated.view_as(p))
+                self.checkpoints[i] = [extrapolated.clone()]
+            if self.reset_state_after_extrap:
+                optimizer.reset_muon_state()
+            return True
+
+        current_params = self._flatten_params().detach().clone()
+        self.checkpoints.append(current_params)
+        if len(self.checkpoints) > self.num_checkpoints:
+            self.checkpoints.pop(0)
+        if progress < self.late_start_progress:
+            return False
+        if step % self.extrap_every != 0 or len(self.checkpoints) < self.num_checkpoints:
+            return False
+        extrapolated = rre_extrapolate(self.checkpoints, regularization=self.regularization)
+        self._unflatten_params(extrapolated)
+        self.checkpoints = [extrapolated.clone()]
+        if self.reset_state_after_extrap:
+            optimizer.reset_muon_state()
+        return True
+
 @torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
@@ -385,6 +466,19 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._schedule_progress = 0.0
         self._late_handoff_applied = False
+        muon_params = []
+        for group in self.param_groups:
+            if group["kind"] == "muon":
+                muon_params.extend(group["params"])
+        self._late_rre = LateMuonRRE(
+            muon_params=muon_params,
+            extrap_every=RRE_EVERY,
+            num_checkpoints=RRE_NUM_CHECKPOINTS,
+            late_start_progress=RRE_LATE_START,
+            reset_state_after_extrap=RRE_RESET_STATE,
+            per_layer=RRE_PER_LAYER,
+            regularization=RRE_REGULARIZATION,
+        )
 
     def set_schedule_progress(self, progress):
         self._schedule_progress = progress
@@ -493,6 +587,24 @@ class MuonAdamW(torch.optim.Optimizer):
                         self._muon_beta2_t, group["ns_steps"], red_dim)
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
+    def reset_muon_state(self):
+        for group in self.param_groups:
+            if group["kind"] != "muon":
+                continue
+            params = group["params"]
+            if not params:
+                continue
+            state = self.state.get(params[0])
+            if not state:
+                continue
+            if "momentum_buffer" in state:
+                state["momentum_buffer"].zero_()
+            if "second_momentum_buffer" in state:
+                state["second_momentum_buffer"].zero_()
+
+    def maybe_apply_late_rre(self, step, progress):
+        return self._late_rre.maybe_step(step, progress, self)
+
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
@@ -570,6 +682,15 @@ LATE_EMBED_EXP_AVG_SHRINK = 0.65
 LATE_EMBED_EXP_AVG_SQ_SHRINK = 0.88
 LATE_SCALAR_EXP_AVG_SHRINK = 0.25
 LATE_SCALAR_EXP_AVG_SQ_SHRINK = 0.72
+RRE_PER_LAYER = True
+RRE_EVERY = 24
+RRE_NUM_CHECKPOINTS = 4
+RRE_LATE_START = 0.68
+RRE_RESET_STATE = True
+RRE_REGULARIZATION = 1e-6
+EXTRAP_COOLDOWN_START = 0.70
+EXTRAP_FINAL_LR_SCALE = 0.58
+EXTRAP_FINAL_MUON_MOMENTUM_DROP = 0.04
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -747,6 +868,16 @@ def get_weight_decay(progress):
     )
     return base + rebound
 
+def get_extrap_cooldown_scale(progress):
+    if progress < EXTRAP_COOLDOWN_START:
+        return 1.0
+    return lerp(1.0, EXTRAP_FINAL_LR_SCALE, phase_mix(progress, EXTRAP_COOLDOWN_START, 1.0))
+
+def get_extrap_momentum_cooldown(progress):
+    if progress < EXTRAP_COOLDOWN_START:
+        return 0.0
+    return lerp(0.0, EXTRAP_FINAL_MUON_MOMENTUM_DROP, phase_mix(progress, EXTRAP_COOLDOWN_START, 1.0))
+
 def get_grad_accum_steps(progress):
     if progress < LATE_ACCUM_START:
         return base_grad_accum_steps
@@ -781,12 +912,16 @@ while True:
 
     # Progress and schedules
     muon_weight_decay = get_weight_decay(progress)
+    extrap_lr_scale = get_extrap_cooldown_scale(progress)
     report_lrm = None
     optimizer.set_schedule_progress(progress)
     for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * get_group_lr_multiplier(group, progress)
+        group["lr"] = group["initial_lr"] * get_group_lr_multiplier(group, progress) * extrap_lr_scale
         if group['kind'] == 'muon':
-            group["momentum"] = get_muon_momentum(step, progress, group["shape_class"])
+            group["momentum"] = max(
+                0.80,
+                get_muon_momentum(step, progress, group["shape_class"]) - get_extrap_momentum_cooldown(progress),
+            )
             group["beta2"] = get_muon_beta2(progress, group["shape_class"])
             group["weight_decay"] = muon_weight_decay
             if report_lrm is None and group["shape_class"] == "square":
@@ -794,6 +929,7 @@ while True:
     if report_lrm is None:
         report_lrm = 0.0
     optimizer.step()
+    did_extrap = optimizer.maybe_apply_late_rre(step + 1, progress)
     model.zero_grad(set_to_none=True)
 
     train_loss_f = train_loss.item()
@@ -822,6 +958,8 @@ while True:
     remaining = max(0, TIME_BUDGET - total_training_time)
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {report_lrm:.2f} | accum: {current_grad_accum_steps} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    if did_extrap:
+        print(f"\nlate_rre step {step + 1} progress {progress:.3f} per_layer {RRE_PER_LAYER} every {RRE_EVERY}", flush=True)
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:

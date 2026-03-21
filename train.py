@@ -316,6 +316,83 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
+
+def rre_extrapolate(iterates):
+    """Global reduced-rank extrapolation over flattened iterates."""
+    k = len(iterates) - 1
+    if k < 2:
+        return iterates[-1].clone()
+
+    orig_dtype = iterates[0].dtype
+    iterates_f32 = [x.float() for x in iterates]
+    diffs = [iterates_f32[i + 1] - iterates_f32[i] for i in range(k)]
+    u_mat = torch.stack(diffs)
+    gram = u_mat @ u_mat.T
+    reg = 1e-6 * torch.trace(gram) / k + 1e-10
+    gram = gram + reg * torch.eye(k, device=gram.device, dtype=gram.dtype)
+    ones = torch.ones(k, device=gram.device, dtype=gram.dtype)
+    coeffs = torch.linalg.solve(gram, ones)
+    coeffs = coeffs / coeffs.sum()
+    gamma = torch.flip(torch.cumsum(torch.flip(coeffs, [0]), 0), [0])
+    return (iterates_f32[-1] - (gamma @ u_mat)).to(orig_dtype)
+
+
+class GlobalMuonRRE:
+    """Late global RRE for Muon-only parameters."""
+
+    def __init__(self, optimizer, late_start_progress=0.90, extrap_every=20, num_checkpoints=4):
+        self.optimizer = optimizer
+        self.late_start_progress = late_start_progress
+        self.extrap_every = extrap_every
+        self.num_checkpoints = num_checkpoints
+        self.checkpoints = []
+        self.extrap_count = 0
+        self.muon_groups = [group for group in optimizer.param_groups if group["kind"] == "muon"]
+
+    def _flatten_muon_params(self):
+        return torch.cat([p.data.flatten() for group in self.muon_groups for p in group["params"]])
+
+    def _restore_muon_params(self, flat_params):
+        offset = 0
+        for group in self.muon_groups:
+            for p in group["params"]:
+                numel = p.numel()
+                p.data.copy_(flat_params[offset:offset + numel].view_as(p))
+                offset += numel
+
+    def _reset_muon_state(self):
+        for group in self.muon_groups:
+            params = group["params"]
+            if not params:
+                continue
+            state = self.optimizer.state.get(params[0])
+            if not state:
+                continue
+            if "momentum_buffer" in state:
+                state["momentum_buffer"].zero_()
+            if "second_momentum_buffer" in state:
+                state["second_momentum_buffer"].zero_()
+
+    @torch.no_grad()
+    def maybe_step(self, step, progress):
+        if progress < self.late_start_progress:
+            return False
+
+        current_params = self._flatten_muon_params().detach().clone()
+        self.checkpoints.append(current_params)
+        if len(self.checkpoints) > self.num_checkpoints:
+            self.checkpoints.pop(0)
+
+        if step % self.extrap_every != 0 or len(self.checkpoints) < self.num_checkpoints:
+            return False
+
+        extrapolated = rre_extrapolate(self.checkpoints)
+        self._restore_muon_params(extrapolated)
+        self.checkpoints = [extrapolated.clone()]
+        self._reset_muon_state()
+        self.extrap_count += 1
+        return True
+
 @torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
@@ -445,6 +522,21 @@ class MuonAdamW(torch.optim.Optimizer):
                     state["exp_avg_sq"].mul_(exp_avg_sq_shrink)
         self._late_handoff_applied = True
 
+    def reset_muon_state(self):
+        for group in self.param_groups:
+            if group["kind"] != "muon":
+                continue
+            params = group["params"]
+            if not params:
+                continue
+            state = self.state.get(params[0])
+            if not state:
+                continue
+            if "momentum_buffer" in state:
+                state["momentum_buffer"].zero_()
+            if "second_momentum_buffer" in state:
+                state["second_momentum_buffer"].zero_()
+
     def _step_adamw(self, group):
         for p in group['params']:
             if p.grad is None:
@@ -560,6 +652,9 @@ WEIGHT_DECAY_REBOUND_PEAK = 0.90
 WEIGHT_DECAY_REBOUND_END = 1.00
 LATE_ACCUM_START = 0.82
 LATE_ACCUM_STEP_DELTA = 1
+RRE_LATE_START_PROGRESS = 0.90
+RRE_EXTRAP_EVERY = 20
+RRE_NUM_CHECKPOINTS = 4
 LATE_SQUARE_MUON_MOMENTUM_SHRINK = 0.58
 LATE_SQUARE_MUON_SECOND_SHRINK = 0.78
 LATE_RECT_MUON_MOMENTUM_SHRINK = 0.70
@@ -630,6 +725,12 @@ optimizer = model.setup_optimizer(
     matrix_lr=MATRIX_LR,
     weight_decay=WEIGHT_DECAY,
 )
+muon_rre = GlobalMuonRRE(
+    optimizer,
+    late_start_progress=RRE_LATE_START_PROGRESS,
+    extrap_every=RRE_EXTRAP_EVERY,
+    num_checkpoints=RRE_NUM_CHECKPOINTS,
+)
 
 model = torch.compile(model, dynamic=False)
 
@@ -639,6 +740,7 @@ x, y, epoch = next(train_loader)  # prefetch first batch
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Base gradient accumulation steps: {base_grad_accum_steps}")
 print(f"Tail gradient accumulation steps: {tail_grad_accum_steps} (starts at progress {LATE_ACCUM_START:.2f})")
+print(f"Muon RRE: late_start={RRE_LATE_START_PROGRESS:.2f} every={RRE_EXTRAP_EVERY} k={RRE_NUM_CHECKPOINTS}")
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 
@@ -794,6 +896,7 @@ while True:
     if report_lrm is None:
         report_lrm = 0.0
     optimizer.step()
+    muon_rre.maybe_step(step + 1, progress)
     model.zero_grad(set_to_none=True)
 
     train_loss_f = train_loss.item()
@@ -821,7 +924,7 @@ while True:
     mfu = 100 * num_flops_per_token * current_total_batch_size / dt / H100_BF16_PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {report_lrm:.2f} | accum: {current_grad_accum_steps} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {report_lrm:.2f} | rre: {muon_rre.extrap_count} | accum: {current_grad_accum_steps} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:

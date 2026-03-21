@@ -367,6 +367,33 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 
 
+def rre_extrapolate(iterates, regularization=1e-6):
+    """Reduced Rank Extrapolation on a short sequence of tensor snapshots."""
+    k = len(iterates) - 1
+    if k < 2:
+        return iterates[-1].clone()
+
+    orig_dtype = iterates[0].dtype
+    iterates_f32 = [x.float() for x in iterates]
+    diffs = [iterates_f32[i + 1] - iterates_f32[i] for i in range(k)]
+    u = torch.stack(diffs)
+    gram = u @ u.T
+
+    reg = regularization * torch.trace(gram) / k + 1e-10
+    gram = gram + reg * torch.eye(k, device=gram.device, dtype=gram.dtype)
+    ones = torch.ones(k, dtype=gram.dtype, device=gram.device)
+
+    try:
+        coeffs = torch.linalg.solve(gram, ones)
+        coeffs = coeffs / coeffs.sum()
+    except Exception:
+        return iterates[-1].clone()
+
+    gamma = torch.flip(torch.cumsum(torch.flip(coeffs, [0]), 0), [0])
+    extrapolated = iterates_f32[-1] - (gamma @ u)
+    return extrapolated.to(orig_dtype)
+
+
 class MuonAdamW(torch.optim.Optimizer):
     """Combined optimizer: Muon for 2D matrix params, AdamW for others."""
 
@@ -385,6 +412,14 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._schedule_progress = 0.0
         self._late_handoff_applied = False
+        self._rre_step = 0
+        self._rre_extrap_count = 0
+        self._muon_params = [
+            p
+            for group in self.param_groups
+            if group["kind"] == "muon"
+            for p in group["params"]
+        ]
 
     def set_schedule_progress(self, progress):
         self._schedule_progress = progress
@@ -445,6 +480,52 @@ class MuonAdamW(torch.optim.Optimizer):
                     state["exp_avg_sq"].mul_(exp_avg_sq_shrink)
         self._late_handoff_applied = True
 
+    def _record_muon_rre_history(self):
+        if self._schedule_progress < RRE_RECORD_START:
+            return
+        for p in self._muon_params:
+            state = self.state.get(p)
+            if not state:
+                continue
+            history = state.setdefault("rre_checkpoints", [])
+            history.append(p.detach().clone())
+            if len(history) > RRE_NUM_CHECKPOINTS:
+                history.pop(0)
+
+    def _reset_muon_state(self):
+        for p in self._muon_params:
+            state = self.state.get(p)
+            if not state:
+                continue
+            if "momentum_buffer" in state:
+                state["momentum_buffer"].zero_()
+            if "second_momentum_buffer" in state:
+                state["second_momentum_buffer"].zero_()
+
+    def maybe_apply_rre(self):
+        if self._schedule_progress < RRE_LATE_START:
+            return
+        if self._rre_step % RRE_EVERY != 0:
+            return
+
+        histories = []
+        for p in self._muon_params:
+            state = self.state.get(p)
+            if not state:
+                return
+            history = state.get("rre_checkpoints")
+            if history is None or len(history) < RRE_NUM_CHECKPOINTS:
+                return
+            histories.append((p, history))
+
+        for p, history in histories:
+            extrapolated = rre_extrapolate(history, regularization=RRE_REGULARIZATION)
+            p.copy_(extrapolated)
+            history[:] = [extrapolated.detach().clone()]
+
+        self._reset_muon_state()
+        self._rre_extrap_count += 1
+
     def _step_adamw(self, group):
         for p in group['params']:
             if p.grad is None:
@@ -500,6 +581,9 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._step_adamw(group)
             elif group['kind'] == 'muon':
                 self._step_muon(group)
+        self._rre_step += 1
+        self._record_muon_rre_history()
+        self.maybe_apply_rre()
 
 # ---------------------------------------------------------------------------
 # Hyperparameters (edit these directly, no CLI flags needed)
@@ -570,6 +654,11 @@ LATE_EMBED_EXP_AVG_SHRINK = 0.65
 LATE_EMBED_EXP_AVG_SQ_SHRINK = 0.88
 LATE_SCALAR_EXP_AVG_SHRINK = 0.25
 LATE_SCALAR_EXP_AVG_SQ_SHRINK = 0.72
+RRE_RECORD_START = 0.78
+RRE_LATE_START = 0.88
+RRE_EVERY = 6
+RRE_NUM_CHECKPOINTS = 4
+RRE_REGULARIZATION = 1e-6
 
 # Model size
 DEPTH = 8               # number of transformer layers

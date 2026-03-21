@@ -19,9 +19,8 @@ import torch.nn.functional as F
 
 from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+# varunneal's FA3 is Hopper only; all other GPUs use PyTorch SDPA.
+fa3 = get_kernel("varunneal/flash-attention-3").flash_attn_interface if cap == (9, 0) else None
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -65,6 +64,7 @@ class CausalSelfAttention(nn.Module):
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
+        self.use_fa3 = cap == (9, 0)
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
         self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
@@ -90,7 +90,17 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if self.use_fa3:
+            y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        else:
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            if self.n_kv_head == self.n_head:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0)
+            else:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0, enable_gqa=True)
+            y = y.transpose(1, 2)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y

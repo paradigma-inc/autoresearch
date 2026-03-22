@@ -893,13 +893,17 @@ total_training_time = 0
 total_tokens = 0
 measured_tokens = 0
 step = 0
+scalar_transition_pause_next_step = False
 
 while True:
     progress = min(total_training_time / TIME_BUDGET, 1.0)
     current_grad_accum_steps = get_grad_accum_steps(progress)
     current_total_batch_size = current_grad_accum_steps * tokens_per_fwdbwd
     optimizer.set_schedule_progress(progress)
+    late_handoff_before = optimizer._late_handoff_applied
     optimizer.maybe_apply_late_handoff(progress)
+    if not late_handoff_before and optimizer._late_handoff_applied:
+        scalar_transition_pause_next_step = True
     torch.cuda.synchronize()
     t0 = time.time()
     for micro_step in range(current_grad_accum_steps):
@@ -913,10 +917,14 @@ while True:
     # Progress and schedules
     muon_weight_decay = get_weight_decay(progress)
     extrap_lr_scale = get_extrap_cooldown_scale(progress)
+    scalar_lr_scale = 0.0 if scalar_transition_pause_next_step else 1.0
+    scalar_transition_pause_next_step = False
     report_lrm = None
     optimizer.set_schedule_progress(progress)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * get_group_lr_multiplier(group, progress) * extrap_lr_scale
+        if group["kind"] == "adamw" and group["subkind"] in ("resid", "x0"):
+            group["lr"] *= scalar_lr_scale
         if group['kind'] == 'muon':
             group["momentum"] = max(
                 0.80,
@@ -930,6 +938,8 @@ while True:
         report_lrm = 0.0
     optimizer.step()
     did_extrap = optimizer.maybe_apply_late_rre(step + 1, progress)
+    if did_extrap:
+        scalar_transition_pause_next_step = True
     model.zero_grad(set_to_none=True)
 
     train_loss_f = train_loss.item()

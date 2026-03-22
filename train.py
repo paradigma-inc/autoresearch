@@ -465,6 +465,9 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._schedule_progress = 0.0
+        self._freshness_adam_applied = False
+        self._freshness_rect_applied = False
+        self._freshness_square_applied = False
         self._late_handoff_applied = False
         muon_params = []
         for group in self.param_groups:
@@ -495,6 +498,59 @@ class MuonAdamW(torch.optim.Optimizer):
                 state["momentum_buffer"].mul_(RECT_MUON_MOMENTUM_SHRINK)
                 state["second_momentum_buffer"].mul_(RECT_MUON_SECOND_SHRINK)
                 state["reset_ladder_stage"] = 2
+
+    def maybe_apply_freshness_ladder(self, progress):
+        if not self._freshness_adam_applied and progress >= FRESHNESS_ADAM_START:
+            for group in self.param_groups:
+                if group["kind"] != "adamw" or group["subkind"] not in ("lm_head", "token_embed", "value_embed"):
+                    continue
+                if group["subkind"] == "lm_head":
+                    exp_avg_shrink = FRESHNESS_HEAD_EXP_AVG_SHRINK
+                    exp_avg_sq_shrink = FRESHNESS_HEAD_EXP_AVG_SQ_SHRINK
+                else:
+                    exp_avg_shrink = FRESHNESS_EMBED_EXP_AVG_SHRINK
+                    exp_avg_sq_shrink = FRESHNESS_EMBED_EXP_AVG_SQ_SHRINK
+                for p in group["params"]:
+                    state = self.state.get(p)
+                    if not state:
+                        continue
+                    if "exp_avg" in state:
+                        state["exp_avg"].mul_(exp_avg_shrink)
+                    if "exp_avg_sq" in state:
+                        state["exp_avg_sq"].mul_(exp_avg_sq_shrink)
+            self._freshness_adam_applied = True
+
+        if not self._freshness_rect_applied and progress >= FRESHNESS_RECT_MUON_START:
+            for group in self.param_groups:
+                if group["kind"] != "muon" or group["shape_class"] != "rect":
+                    continue
+                params = group["params"]
+                if not params:
+                    continue
+                state = self.state.get(params[0])
+                if not state:
+                    continue
+                if "momentum_buffer" in state:
+                    state["momentum_buffer"].mul_(FRESHNESS_RECT_MUON_MOMENTUM_SHRINK)
+                if "second_momentum_buffer" in state:
+                    state["second_momentum_buffer"].mul_(FRESHNESS_RECT_MUON_SECOND_SHRINK)
+            self._freshness_rect_applied = True
+
+        if not self._freshness_square_applied and progress >= FRESHNESS_SQUARE_MUON_START:
+            for group in self.param_groups:
+                if group["kind"] != "muon" or group["shape_class"] != "square":
+                    continue
+                params = group["params"]
+                if not params:
+                    continue
+                state = self.state.get(params[0])
+                if not state:
+                    continue
+                if "momentum_buffer" in state:
+                    state["momentum_buffer"].mul_(FRESHNESS_SQUARE_MUON_MOMENTUM_SHRINK)
+                if "second_momentum_buffer" in state:
+                    state["second_momentum_buffer"].mul_(FRESHNESS_SQUARE_MUON_SECOND_SHRINK)
+            self._freshness_square_applied = True
 
     def maybe_apply_late_handoff(self, progress):
         if self._late_handoff_applied or progress < LATE_ACCUM_START:
@@ -682,6 +738,37 @@ LATE_EMBED_EXP_AVG_SHRINK = 0.65
 LATE_EMBED_EXP_AVG_SQ_SHRINK = 0.88
 LATE_SCALAR_EXP_AVG_SHRINK = 0.25
 LATE_SCALAR_EXP_AVG_SQ_SHRINK = 0.72
+FRESHNESS_ADAM_START = 0.72
+FRESHNESS_RECT_MUON_START = 0.84
+FRESHNESS_SQUARE_MUON_START = 0.90
+FRESHNESS_HEAD_EXP_AVG_SHRINK = 0.74
+FRESHNESS_HEAD_EXP_AVG_SQ_SHRINK = 0.90
+FRESHNESS_EMBED_EXP_AVG_SHRINK = 0.84
+FRESHNESS_EMBED_EXP_AVG_SQ_SHRINK = 0.94
+FRESHNESS_RECT_MUON_MOMENTUM_SHRINK = 0.90
+FRESHNESS_RECT_MUON_SECOND_SHRINK = 0.95
+FRESHNESS_SQUARE_MUON_MOMENTUM_SHRINK = 0.92
+FRESHNESS_SQUARE_MUON_SECOND_SHRINK = 0.96
+OUTPUT_CLEANUP_START = 0.90
+OUTPUT_CLEANUP_PEAK = 0.96
+OUTPUT_CLEANUP_END = 1.00
+LM_HEAD_CLEANUP_BOOST = 0.12
+TOKEN_EMBED_CLEANUP_BOOST = 0.16
+SCALAR_CLEANUP_BOOST = 0.08
+TOKEN_EMBED_COOL_START = 0.22
+TOKEN_EMBED_COOL_MID = 0.40
+TOKEN_EMBED_COOL_END = 0.84
+TOKEN_EMBED_COOL_FINAL_FRAC = 0.46
+VALUE_EMBED_COOL_START = 0.26
+VALUE_EMBED_COOL_MID = 0.44
+VALUE_EMBED_COOL_END = 0.72
+VALUE_EMBED_COOL_MID_FRAC = 0.92
+VALUE_EMBED_LATE_HEAT_START = 0.70
+VALUE_EMBED_LATE_HEAT_END = 1.00
+VALUE_EMBED_LATE_HEAT_BOOST = 0.10
+GEOMETRY_MUON_HEAT_START = 0.58
+GEOMETRY_MUON_RECT_BOOST = 0.05
+GEOMETRY_MUON_SQUARE_BOOST = 0.08
 RRE_PER_LAYER = True
 RRE_EVERY = 24
 RRE_NUM_CHECKPOINTS = 4
@@ -799,6 +886,16 @@ def get_muon_final_lr_frac(shape_class):
         return MUON_SQUARE_FINAL_LR_FRAC
     return MUON_RECT_FINAL_LR_FRAC
 
+def cooldown_hold_scale(progress, start, mid, end, floor):
+    if progress < start:
+        return 1.0
+    if progress < mid:
+        return lerp(1.0, floor, phase_mix(progress, start, mid))
+    return lerp(floor, floor, phase_mix(progress, mid, end))
+
+def cleanup_wedge_scale(progress, boost):
+    return 1.0 + boost * cosine_bell(progress, OUTPUT_CLEANUP_START, OUTPUT_CLEANUP_PEAK, OUTPUT_CLEANUP_END)
+
 def get_scalar_quiet_scale(subkind, progress):
     quiet_1 = quiet_window_scale(
         progress, SCALAR_QUIET_1_START, SCALAR_QUIET_1_PEAK, SCALAR_QUIET_1_END,
@@ -809,6 +906,47 @@ def get_scalar_quiet_scale(subkind, progress):
         RESID_QUIET_2_FLOOR if subkind == 'resid' else X0_QUIET_2_FLOOR,
     )
     return min(quiet_1, quiet_2)
+
+def get_output_handoff_scale(subkind, progress):
+    if subkind == 'lm_head':
+        cool = cooldown_hold_scale(progress, 0.26, 0.46, 0.86, 0.56)
+        return cool * cleanup_wedge_scale(progress, LM_HEAD_CLEANUP_BOOST)
+    if subkind == 'token_embed':
+        cool = cooldown_hold_scale(
+            progress, TOKEN_EMBED_COOL_START, TOKEN_EMBED_COOL_MID, TOKEN_EMBED_COOL_END,
+            TOKEN_EMBED_COOL_FINAL_FRAC,
+        )
+        return cool * cleanup_wedge_scale(progress, TOKEN_EMBED_CLEANUP_BOOST)
+    if subkind in ('resid', 'x0'):
+        return get_scalar_quiet_scale(subkind, progress) * cleanup_wedge_scale(progress, SCALAR_CLEANUP_BOOST)
+    return 1.0
+
+def get_value_geometry_scale(progress):
+    cool = cooldown_hold_scale(
+        progress, VALUE_EMBED_COOL_START, VALUE_EMBED_COOL_MID, VALUE_EMBED_COOL_END,
+        VALUE_EMBED_COOL_MID_FRAC,
+    )
+    late_heat = 1.0
+    if progress >= VALUE_EMBED_LATE_HEAT_START:
+        late_heat = lerp(
+            1.0,
+            1.0 + VALUE_EMBED_LATE_HEAT_BOOST,
+            phase_mix(progress, VALUE_EMBED_LATE_HEAT_START, VALUE_EMBED_LATE_HEAT_END),
+        )
+    return cool * late_heat
+
+def get_muon_geometry_scale(shape_class, progress):
+    boost = GEOMETRY_MUON_SQUARE_BOOST if shape_class == 'square' else GEOMETRY_MUON_RECT_BOOST
+    if progress < GEOMETRY_MUON_HEAT_START:
+        return 1.0
+    return lerp(1.0, 1.0 + boost, phase_mix(progress, GEOMETRY_MUON_HEAT_START, 1.0))
+
+def get_geometry_bank_scale(group, progress):
+    if group["kind"] == "muon":
+        return get_muon_geometry_scale(group["shape_class"], progress)
+    if group.get("subkind") == 'value_embed':
+        return get_value_geometry_scale(progress)
+    return 1.0
 
 def get_adam_switchback_lr_profile(subkind):
     if subkind == 'lm_head':
@@ -840,8 +978,10 @@ def get_group_lr_multiplier(group, progress):
         base = lerp(recap_lr_frac, recovery_lr_frac, phase_mix(progress, SWITCHBACK_RECAP_START, SWITCHBACK_RECAP_END))
     else:
         base = lerp(recovery_lr_frac, final_lr_frac, phase_mix(progress, SWITCHBACK_RECAP_END, 1.0))
-    if group["kind"] == "adamw" and group["subkind"] in ("resid", "x0"):
-        return base * get_scalar_quiet_scale(group["subkind"], progress)
+    if group["kind"] == "muon" or group.get("subkind") == "value_embed":
+        return base * get_geometry_bank_scale(group, progress)
+    if group["kind"] == "adamw" and group["subkind"] in ("lm_head", "token_embed", "resid", "x0"):
+        return base * get_output_handoff_scale(group["subkind"], progress)
     return base
 
 def get_muon_momentum(step, progress, shape_class):
@@ -899,6 +1039,7 @@ while True:
     current_grad_accum_steps = get_grad_accum_steps(progress)
     current_total_batch_size = current_grad_accum_steps * tokens_per_fwdbwd
     optimizer.set_schedule_progress(progress)
+    optimizer.maybe_apply_freshness_ladder(progress)
     optimizer.maybe_apply_late_handoff(progress)
     torch.cuda.synchronize()
     t0 = time.time()

@@ -135,6 +135,8 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        # Reuse the penultimate hidden state as a tiny late skip path.
+        self.late_skip_layer_idx = max(0, config.n_layer - 2)
         self.window_sizes = self._compute_window_sizes(config)
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
@@ -143,6 +145,7 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
+        self.register_buffer("late_skip_mix", torch.tensor(0.0), persistent=False)
         # Value embeddings
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
@@ -287,11 +290,18 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)
         x = norm(x)
         x0 = x
+        late_skip = None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i])
+            if i == self.late_skip_layer_idx:
+                # Cache the earlier late-layer state and blend it back at the end.
+                late_skip = norm(x)
         x = norm(x)
+        if late_skip is not None:
+            mix = self.late_skip_mix.to(dtype=x.dtype)
+            x = x + mix * (late_skip - x)
 
         softcap = 15
         logits = self.lm_head(x)
@@ -691,6 +701,8 @@ RRE_REGULARIZATION = 1e-6
 EXTRAP_COOLDOWN_START = 0.70
 EXTRAP_FINAL_LR_SCALE = 0.58
 EXTRAP_FINAL_MUON_MOMENTUM_DROP = 0.04
+LATE_SKIP_START = 0.76
+LATE_SKIP_MAX_MIX = 0.03
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -878,6 +890,11 @@ def get_extrap_momentum_cooldown(progress):
         return 0.0
     return lerp(0.0, EXTRAP_FINAL_MUON_MOMENTUM_DROP, phase_mix(progress, EXTRAP_COOLDOWN_START, 1.0))
 
+def get_late_skip_mix(progress):
+    if progress < LATE_SKIP_START:
+        return 0.0
+    return lerp(0.0, LATE_SKIP_MAX_MIX, phase_mix(progress, LATE_SKIP_START, 1.0))
+
 def get_grad_accum_steps(progress):
     if progress < LATE_ACCUM_START:
         return base_grad_accum_steps
@@ -900,6 +917,7 @@ while True:
     current_total_batch_size = current_grad_accum_steps * tokens_per_fwdbwd
     optimizer.set_schedule_progress(progress)
     optimizer.maybe_apply_late_handoff(progress)
+    model.late_skip_mix.fill_(get_late_skip_mix(progress))
     torch.cuda.synchronize()
     t0 = time.time()
     for micro_step in range(current_grad_accum_steps):

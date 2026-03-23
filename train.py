@@ -37,6 +37,16 @@ class GPTConfig:
     n_kv_head: int = 6
     n_embd: int = 768
     window_pattern: str = "SSSL"
+    xsa_mode: str = "final"
+    xsa_eps: float = 1e-6
+    noble_rank: int = 32
+    noble_mlp_fc: bool = True
+    noble_mlp_proj: bool = True
+    noble_wup_alpha: float = 0.01
+    noble_freq_min: float = 0.8
+    noble_freq_max: float = 1.2
+    noble_phase_std: float = 0.1
+    attnres_block_size: int = 4
 
 
 def norm(x):
@@ -46,6 +56,13 @@ def norm(x):
 def has_ve(layer_idx, n_layer):
     """Returns True if layer should have Value Embedding (alternating, last always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
+
+
+def expand_kv_heads(x, n_head):
+    if x.size(2) == n_head:
+        return x
+    repeat = n_head // x.size(2)
+    return x.repeat_interleave(repeat, dim=2)
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -65,6 +82,8 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         self.use_fa3 = cap == (9, 0)
+        self.use_xsa = config.xsa_mode == "final" and layer_idx == config.n_layer - 1
+        self.xsa_eps = config.xsa_eps
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
         self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
@@ -101,9 +120,45 @@ class CausalSelfAttention(nn.Module):
             else:
                 y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0, enable_gqa=True)
             y = y.transpose(1, 2)
+        if self.use_xsa:
+            v_hat = F.normalize(expand_kv_heads(v, self.n_head), dim=-1, eps=self.xsa_eps)
+            y = y - (y * v_hat).sum(dim=-1, keepdim=True) * v_hat
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
+
+
+class NobleBranch(nn.Module):
+    def __init__(self, in_dim, out_dim, rank, wup_alpha, freq_min, freq_max, phase_std):
+        super().__init__()
+        self.rank = rank
+        self.wup_alpha = wup_alpha
+        self.freq_min = freq_min
+        self.freq_max = freq_max
+        self.phase_std = phase_std
+        self.w_down = nn.Parameter(torch.empty(rank, in_dim))
+        self.w_up = nn.Parameter(torch.empty(out_dim, rank))
+        self.mix = nn.Parameter(torch.empty(rank, rank))
+        self.omega1 = nn.Parameter(torch.empty(rank))
+        self.phi1 = nn.Parameter(torch.empty(rank))
+        self.omega2 = nn.Parameter(torch.empty(rank))
+        self.phi2 = nn.Parameter(torch.empty(rank))
+
+    def init_weights(self, base_scale):
+        torch.nn.init.uniform_(self.w_down, -base_scale, base_scale)
+        torch.nn.init.normal_(self.w_up, mean=0.0, std=self.wup_alpha / math.sqrt(self.rank))
+        torch.nn.init.xavier_uniform_(self.mix)
+        torch.nn.init.uniform_(self.omega1, self.freq_min, self.freq_max)
+        torch.nn.init.uniform_(self.omega2, self.freq_min, self.freq_max)
+        torch.nn.init.normal_(self.phi1, mean=0.0, std=self.phase_std)
+        torch.nn.init.normal_(self.phi2, mean=0.0, std=self.phase_std)
+
+    def forward(self, x):
+        h = F.linear(x, self.w_down)
+        h = torch.cos(h * self.omega1 + self.phi1)
+        h = F.linear(h, self.mix)
+        h = torch.cos(h * self.omega2 + self.phi2)
+        return F.linear(h, self.w_up)
 
 
 class MLP(nn.Module):
@@ -111,12 +166,53 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        noble_kwargs = dict(
+            rank=config.noble_rank,
+            wup_alpha=config.noble_wup_alpha,
+            freq_min=config.noble_freq_min,
+            freq_max=config.noble_freq_max,
+            phase_std=config.noble_phase_std,
+        )
+        self.noble_fc = NobleBranch(config.n_embd, 4 * config.n_embd, **noble_kwargs) if config.noble_mlp_fc else None
+        self.noble_proj = NobleBranch(4 * config.n_embd, config.n_embd, **noble_kwargs) if config.noble_mlp_proj else None
 
     def forward(self, x):
-        x = self.c_fc(x)
+        fc_in = x
+        x = self.c_fc(fc_in)
+        if self.noble_fc is not None:
+            x = x + self.noble_fc(fc_in)
         x = F.relu(x).square()
-        x = self.c_proj(x)
+        proj_in = x
+        x = self.c_proj(proj_in)
+        if self.noble_proj is not None:
+            x = x + self.noble_proj(proj_in)
         return x
+
+
+class AttnResRMSNorm(nn.Module):
+    def __init__(self, ndim, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))
+        self.eps = eps
+
+    def forward(self, x):
+        inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return x * inv_rms * self.weight
+
+
+class BlockDepthMixer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        num_queries = config.n_layer * 2 + 1
+        self.queries = nn.Parameter(torch.zeros(num_queries, config.n_embd))
+        self.key_norms = nn.ModuleList([AttnResRMSNorm(config.n_embd) for _ in range(num_queries)])
+
+    def aggregate(self, values, query_idx):
+        stacked = torch.stack(values, dim=0)
+        keys = self.key_norms[query_idx](stacked)
+        logits = torch.einsum("d,nbtd->nbt", self.queries[query_idx], keys)
+        weights = logits.softmax(dim=0)
+        return torch.einsum("nbt,nbtd->btd", weights, stacked)
 
 
 class Block(nn.Module):
@@ -130,6 +226,12 @@ class Block(nn.Module):
         x = x + self.mlp(norm(x))
         return x
 
+    def attn_residual(self, x, ve, cos_sin, window_size):
+        return self.attn(norm(x), ve, cos_sin, window_size)
+
+    def mlp_residual(self, x):
+        return self.mlp(norm(x))
+
 
 class GPT(nn.Module):
     def __init__(self, config):
@@ -140,6 +242,7 @@ class GPT(nn.Module):
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
+        self.depth_mixer = BlockDepthMixer(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
@@ -171,6 +274,10 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.attn.c_proj.weight)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if block.mlp.noble_fc is not None:
+                block.mlp.noble_fc.init_weights(s)
+            if block.mlp.noble_proj is not None:
+                block.mlp.noble_proj.init_weights(s)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
@@ -235,25 +342,58 @@ class GPT(nn.Module):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        transformer_matrices = 0
+        noble_matrices = 0
+        transformer_scalars = 0
+        noble_scalars = 0
+        for name, p in self.transformer.h.named_parameters():
+            if ".noble_" in name:
+                if p.ndim >= 2:
+                    noble_matrices += p.numel()
+                else:
+                    noble_scalars += p.numel()
+            elif p.ndim >= 2:
+                transformer_matrices += p.numel()
+            else:
+                transformer_scalars += p.numel()
+        mixer_matrices = sum(p.numel() for p in self.depth_mixer.parameters() if p.ndim >= 2)
+        mixer_scalars = sum(p.numel() for p in self.depth_mixer.parameters() if p.ndim < 2)
+        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + transformer_scalars + noble_scalars + mixer_scalars
+        total = wte + value_embeds + lm_head + transformer_matrices + noble_matrices + mixer_matrices + scalars
         return {
             'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
-            'transformer_matrices': transformer_matrices, 'scalars': scalars, 'total': total,
+            'transformer_matrices': transformer_matrices + noble_matrices + mixer_matrices,
+            'scalars': scalars,
+            'total': total,
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
+        transformer_named_params = list(self.transformer.h.named_parameters())
+        matrix_params = []
+        noble_matrix_params = []
+        noble_scalar_params = []
+        for name, p in transformer_named_params:
+            if ".noble_" in name:
+                if p.ndim >= 2:
+                    noble_matrix_params.append(p)
+                else:
+                    noble_scalar_params.append(p)
+            else:
+                matrix_params.append(p)
+        attnres_matrix_params = [p for p in self.depth_mixer.parameters() if p.ndim >= 2]
+        attnres_scalar_params = [p for p in self.depth_mixer.parameters() if p.ndim < 2]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+        assert len(list(self.parameters())) == (
+            len(matrix_params) + len(noble_matrix_params) + len(noble_scalar_params) +
+            len(attnres_matrix_params) + len(attnres_scalar_params) + len(embedding_params) +
+            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        )
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -268,6 +408,26 @@ class GPT(nn.Module):
             dict(kind='adamw', subkind='resid', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', subkind='x0', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        if noble_scalar_params:
+            param_groups.append(dict(
+                kind='adamw', subkind='noble_scalar', params=noble_scalar_params, lr=scalar_lr * 0.1,
+                betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
+        if noble_matrix_params:
+            param_groups.append(dict(
+                kind='adamw', subkind='noble_matrix', params=noble_matrix_params, lr=matrix_lr * 0.25,
+                betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
+        if attnres_scalar_params:
+            param_groups.append(dict(
+                kind='adamw', subkind='attnres_scalar', params=attnres_scalar_params, lr=scalar_lr * 0.1,
+                betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
+        if attnres_matrix_params:
+            param_groups.append(dict(
+                kind='adamw', subkind='attnres_matrix', params=attnres_matrix_params, lr=matrix_lr * 0.25,
+                betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
@@ -287,10 +447,39 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)
         x = norm(x)
         x0 = x
+        completed_blocks = []
+        partial_block = None
+        query_idx = 0
+
+        def select_sources():
+            values = [x0] + completed_blocks
+            if partial_block is not None:
+                values.append(partial_block)
+            return values
+
+        def update_block_state(output, sublayer_idx):
+            nonlocal partial_block
+            partial_block = output if partial_block is None else partial_block + output
+            if (sublayer_idx + 1) % self.config.attnres_block_size == 0:
+                completed_blocks.append(partial_block)
+                partial_block = None
+
         for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
+
+            hidden = self.depth_mixer.aggregate(select_sources(), query_idx)
+            hidden = self.resid_lambdas[i] * hidden + self.x0_lambdas[i] * x0
+            attn_out = block.attn_residual(hidden, ve, cos_sin, self.window_sizes[i])
+            update_block_state(attn_out, query_idx)
+            query_idx += 1
+
+            hidden = self.depth_mixer.aggregate(select_sources(), query_idx)
+            hidden = self.resid_lambdas[i] * hidden + self.x0_lambdas[i] * x0
+            mlp_out = block.mlp_residual(hidden)
+            update_block_state(mlp_out, query_idx)
+            query_idx += 1
+
+        x = self.depth_mixer.aggregate(select_sources(), query_idx)
         x = norm(x)
 
         softcap = 15

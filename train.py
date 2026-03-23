@@ -37,6 +37,14 @@ class GPTConfig:
     n_kv_head: int = 6
     n_embd: int = 768
     window_pattern: str = "SSSL"
+    noble_rank: int = 0
+    noble_mlp_fc: bool = False
+    noble_mlp_proj: bool = False
+    noble_wup_alpha: float = 0.01
+    noble_freq_min: float = 0.8
+    noble_freq_max: float = 1.2
+    noble_phase_std: float = 0.1
+    noble_activation: str = "cos_net"
 
 
 def norm(x):
@@ -55,6 +63,72 @@ def apply_rotary_emb(x, cos, sin):
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
+
+
+class NobleBranch(nn.Module):
+    def __init__(self, in_dim, out_dim, rank, wup_alpha=0.01, freq_min=0.8, freq_max=1.2,
+                 phase_std=0.1, activation="cos_net"):
+        super().__init__()
+        self.rank = rank
+        self.wup_alpha = wup_alpha
+        self.freq_min = freq_min
+        self.freq_max = freq_max
+        self.phase_std = phase_std
+        self.activation = activation.lower()
+
+        self.w_down = nn.Parameter(torch.empty(rank, in_dim))
+        self.w_up = nn.Parameter(torch.empty(out_dim, rank))
+        self.mix = nn.Parameter(torch.empty(rank, rank))
+        self.w_down.lr_mult = 1.0
+        self.w_up.lr_mult = 0.2
+        self.mix.lr_mult = 1.0
+        if self.activation == "cos_net":
+            self.omega1 = nn.Parameter(torch.empty(rank))
+            self.phi1 = nn.Parameter(torch.empty(rank))
+            self.omega2 = nn.Parameter(torch.empty(rank))
+            self.phi2 = nn.Parameter(torch.empty(rank))
+            self.omega1.lr_mult = 1.0
+            self.phi1.lr_mult = 1.0
+            self.omega2.lr_mult = 1.0
+            self.phi2.lr_mult = 1.0
+        else:
+            self.register_parameter("omega1", None)
+            self.register_parameter("phi1", None)
+            self.register_parameter("omega2", None)
+            self.register_parameter("phi2", None)
+
+    def init_weights(self, base_scale):
+        torch.nn.init.uniform_(self.w_down, -base_scale, base_scale)
+        torch.nn.init.normal_(self.w_up, mean=0.0, std=self.wup_alpha / math.sqrt(self.rank))
+        torch.nn.init.xavier_uniform_(self.mix)
+        if self.activation == "cos_net":
+            torch.nn.init.uniform_(self.omega1, self.freq_min, self.freq_max)
+            torch.nn.init.uniform_(self.omega2, self.freq_min, self.freq_max)
+            torch.nn.init.normal_(self.phi1, mean=0.0, std=self.phase_std)
+            torch.nn.init.normal_(self.phi2, mean=0.0, std=self.phase_std)
+
+    def _apply_activation(self, h):
+        if self.activation == "cos_net":
+            return torch.cos(h * self.omega1 + self.phi1)
+        if self.activation == "gelu_net":
+            return F.gelu(h)
+        if self.activation == "silu_net":
+            return F.silu(h)
+        if self.activation == "tanh_net":
+            return torch.tanh(h)
+        if self.activation == "identity":
+            return h
+        raise ValueError(f"Unsupported NOBLE activation: {self.activation}")
+
+    def forward(self, x):
+        h = F.linear(x, self.w_down)
+        h = self._apply_activation(h)
+        h = F.linear(h, self.mix)
+        if self.activation == "cos_net":
+            h = torch.cos(h * self.omega2 + self.phi2)
+        else:
+            h = self._apply_activation(h)
+        return F.linear(h, self.w_up)
 
 
 class CausalSelfAttention(nn.Module):
@@ -111,11 +185,27 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        noble_kwargs = dict(
+            rank=config.noble_rank,
+            wup_alpha=config.noble_wup_alpha,
+            freq_min=config.noble_freq_min,
+            freq_max=config.noble_freq_max,
+            phase_std=config.noble_phase_std,
+            activation=config.noble_activation,
+        )
+        self.noble_fc = NobleBranch(config.n_embd, 4 * config.n_embd, **noble_kwargs) if config.noble_mlp_fc else None
+        self.noble_proj = NobleBranch(4 * config.n_embd, config.n_embd, **noble_kwargs) if config.noble_mlp_proj else None
 
     def forward(self, x):
+        fc_in = x
         x = self.c_fc(x)
+        if self.noble_fc is not None:
+            x = x + self.noble_fc(fc_in)
         x = F.relu(x).square()
+        proj_in = x
         x = self.c_proj(x)
+        if self.noble_proj is not None:
+            x = x + self.noble_proj(proj_in)
         return x
 
 
@@ -171,6 +261,10 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.attn.c_proj.weight)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if block.mlp.noble_fc is not None:
+                block.mlp.noble_fc.init_weights(s)
+            if block.mlp.noble_proj is not None:
+                block.mlp.noble_proj.init_weights(s)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
@@ -246,14 +340,31 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
+        transformer_named_params = list(self.transformer.h.named_parameters())
+        matrix_params = []
+        transformer_scalar_params = []
+        noble_matrix_params = []
+        noble_scalar_params = []
+        for name, p in transformer_named_params:
+            if ".noble_" in name:
+                if p.ndim >= 2:
+                    noble_matrix_params.append(p)
+                else:
+                    noble_scalar_params.append(p)
+            elif p.ndim >= 2:
+                matrix_params.append(p)
+            else:
+                transformer_scalar_params.append(p)
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+        assert len(list(self.parameters())) == (
+            len(matrix_params) + len(noble_matrix_params) + len(embedding_params) +
+            len(lm_head_params) + len(value_embeds_params) + len(resid_params) +
+            len(x0_params) + len(transformer_scalar_params) + len(noble_scalar_params)
+        )
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -268,6 +379,21 @@ class GPT(nn.Module):
             dict(kind='adamw', subkind='resid', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', subkind='x0', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        if transformer_scalar_params:
+            param_groups.append(dict(
+                kind='adamw', subkind='transformer_scalar', params=transformer_scalar_params, lr=scalar_lr * 0.1,
+                betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
+        if noble_scalar_params:
+            param_groups.append(dict(
+                kind='adamw', subkind='noble_scalar', params=noble_scalar_params, lr=scalar_lr * 0.1,
+                betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
+        if noble_matrix_params:
+            param_groups.append(dict(
+                kind='adamw', subkind='noble_matrix', params=noble_matrix_params, lr=matrix_lr * 0.25,
+                betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
@@ -600,6 +726,7 @@ class MuonAdamW(torch.optim.Optimizer):
             if p.grad is None:
                 continue
             grad = p.grad
+            lr_mult = getattr(p, "lr_mult", 1.0)
             state = self.state[p]
             if not state:
                 state['step'] = 0
@@ -607,7 +734,7 @@ class MuonAdamW(torch.optim.Optimizer):
                 state['exp_avg_sq'] = torch.zeros_like(p)
             state['step'] += 1
             self._adamw_step_t.fill_(state['step'])
-            self._adamw_lr_t.fill_(group['lr'])
+            self._adamw_lr_t.fill_(group['lr'] * lr_mult)
             self._adamw_beta1_t.fill_(group['betas'][0])
             self._adamw_beta2_t.fill_(group['betas'][1])
             self._adamw_eps_t.fill_(group['eps'])
@@ -686,6 +813,14 @@ MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
+NOBLE_RANK = 32
+NOBLE_MLP_FC = True
+NOBLE_MLP_PROJ = True
+NOBLE_WUP_ALPHA = 0.01
+NOBLE_FREQ_MIN = 0.8
+NOBLE_FREQ_MAX = 1.2
+NOBLE_PHASE_STD = 0.1
+NOBLE_ACT = "cos_net"
 # Keep the early 039 schedule, then add a staged Muon reset ladder and a cautious tail rebound.
 SWITCHBACK_RECAP_START = 0.68
 SWITCHBACK_RECAP_END = 0.84
@@ -807,6 +942,14 @@ def build_model_config(depth):
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
+        noble_rank=NOBLE_RANK,
+        noble_mlp_fc=NOBLE_MLP_FC,
+        noble_mlp_proj=NOBLE_MLP_PROJ,
+        noble_wup_alpha=NOBLE_WUP_ALPHA,
+        noble_freq_min=NOBLE_FREQ_MIN,
+        noble_freq_max=NOBLE_FREQ_MAX,
+        noble_phase_std=NOBLE_PHASE_STD,
+        noble_activation=NOBLE_ACT,
     )
 
 config = build_model_config(DEPTH)
@@ -847,6 +990,15 @@ x, y, epoch = next(train_loader)  # prefetch first batch
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Base gradient accumulation steps: {base_grad_accum_steps}")
 print(f"Tail gradient accumulation steps: {tail_grad_accum_steps} (starts at progress {LATE_ACCUM_START:.2f})")
+if config.noble_rank > 0:
+    noble_targets = []
+    if config.noble_mlp_fc:
+        noble_targets.append("mlp_fc")
+    if config.noble_mlp_proj:
+        noble_targets.append("mlp_proj")
+    print(f"noble_rank:       {config.noble_rank}")
+    print(f"noble_activation: {config.noble_activation}")
+    print(f"noble_targets:    {', '.join(noble_targets)}")
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 

@@ -98,6 +98,7 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        v_for_xsa = v
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
@@ -121,7 +122,7 @@ class CausalSelfAttention(nn.Module):
                 y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0, enable_gqa=True)
             y = y.transpose(1, 2)
         if self.use_xsa:
-            v_hat = F.normalize(expand_kv_heads(v, self.n_head), dim=-1, eps=self.xsa_eps)
+            v_hat = F.normalize(expand_kv_heads(v_for_xsa, self.n_head), dim=-1, eps=self.xsa_eps)
             y = y - (y * v_hat).sum(dim=-1, keepdim=True) * v_hat
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
@@ -586,7 +587,6 @@ class LateMuonRRE:
             optimizer.reset_muon_state()
         return True
 
-@torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
@@ -789,6 +789,7 @@ class MuonAdamW(torch.optim.Optimizer):
             if p.grad is None:
                 continue
             grad = p.grad
+            lr_mult = getattr(p, "lr_mult", 1.0)
             state = self.state[p]
             if not state:
                 state['step'] = 0
@@ -796,7 +797,7 @@ class MuonAdamW(torch.optim.Optimizer):
                 state['exp_avg_sq'] = torch.zeros_like(p)
             state['step'] += 1
             self._adamw_step_t.fill_(state['step'])
-            self._adamw_lr_t.fill_(group['lr'])
+            self._adamw_lr_t.fill_(group['lr'] * lr_mult)
             self._adamw_beta1_t.fill_(group['betas'][0])
             self._adamw_beta2_t.fill_(group['betas'][1])
             self._adamw_eps_t.fill_(group['eps'])

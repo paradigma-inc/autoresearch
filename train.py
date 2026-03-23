@@ -37,6 +37,8 @@ class GPTConfig:
     n_kv_head: int = 6
     n_embd: int = 768
     window_pattern: str = "SSSL"
+    xsa_mode: str = "final"
+    xsa_eps: float = 1e-6
 
 
 def norm(x):
@@ -71,8 +73,19 @@ class CausalSelfAttention(nn.Module):
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        xsa_mode = config.xsa_mode.lower()
+        if xsa_mode not in {"off", "all", "final"}:
+            raise ValueError(f"Unsupported XSA mode: {config.xsa_mode}")
+        self.use_xsa = xsa_mode == "all" or (xsa_mode == "final" and layer_idx == config.n_layer - 1)
+        self.xsa_eps = config.xsa_eps
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+
+    def _expand_kv_heads(self, tensor):
+        if self.n_kv_head == self.n_head:
+            return tensor
+        assert self.n_head % self.n_kv_head == 0
+        return tensor.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
@@ -101,6 +114,10 @@ class CausalSelfAttention(nn.Module):
             else:
                 y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0, enable_gqa=True)
             y = y.transpose(1, 2)
+        if self.use_xsa:
+            v_q = self._expand_kv_heads(v)
+            v_hat = F.normalize(v_q, dim=-1, eps=self.xsa_eps)
+            y = y - (y * v_hat).sum(dim=-1, keepdim=True) * v_hat
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -677,6 +694,8 @@ class MuonAdamW(torch.optim.Optimizer):
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+XSA_MODE = "final"
+XSA_EPS = 1e-6
 
 # Optimization
 TOTAL_BATCH_SIZE = 196608 # moderate batch line: more optimizer steps in 5 minutes
@@ -807,6 +826,8 @@ def build_model_config(depth):
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
+        xsa_mode=XSA_MODE,
+        xsa_eps=XSA_EPS,
     )
 
 config = build_model_config(DEPTH)

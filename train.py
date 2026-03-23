@@ -37,6 +37,8 @@ class GPTConfig:
     n_kv_head: int = 6
     n_embd: int = 768
     window_pattern: str = "SSSL"
+    attnres_mode: str = "baseline"
+    attnres_use_rmsnorm: bool = True
 
 
 def norm(x):
@@ -55,6 +57,42 @@ def apply_rotary_emb(x, cos, sin):
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
+
+
+class AttnResRMSNorm(nn.Module):
+    def __init__(self, ndim, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))
+        self.eps = eps
+
+    def forward(self, x):
+        inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return x * inv_rms * self.weight
+
+
+class DepthMixer(nn.Module):
+    def __init__(self, config, num_queries):
+        super().__init__()
+        self.use_rmsnorm = config.attnres_use_rmsnorm
+        self.queries = nn.Parameter(torch.zeros(num_queries, config.n_embd))
+        self.key_norms = (
+            nn.ModuleList([AttnResRMSNorm(config.n_embd) for _ in range(num_queries)])
+            if self.use_rmsnorm
+            else nn.ModuleList()
+        )
+
+    def _normalize_keys(self, values, query_idx):
+        if not self.use_rmsnorm:
+            return values
+        return self.key_norms[query_idx](values)
+
+    def aggregate(self, values, query_idx):
+        stacked = torch.stack(values, dim=0)
+        keys = self._normalize_keys(stacked, query_idx)
+        query = self.queries[query_idx]
+        logits = torch.einsum("d,nbtd->nbt", query, keys)
+        weights = logits.softmax(dim=0)
+        return torch.einsum("nbt,nbtd->btd", weights, stacked)
 
 
 class CausalSelfAttention(nn.Module):
@@ -125,9 +163,15 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
+    def attn_residual(self, x, ve, cos_sin, window_size):
+        return self.attn(norm(x), ve, cos_sin, window_size)
+
+    def mlp_residual(self, x):
+        return self.mlp(norm(x))
+
     def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
+        x = x + self.attn_residual(x, ve, cos_sin, window_size)
+        x = x + self.mlp_residual(x)
         return x
 
 
@@ -135,6 +179,10 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        if config.attnres_mode not in ("baseline", "full"):
+            raise ValueError(f"Unsupported attnres mode: {config.attnres_mode}")
+        self.use_attnres = config.attnres_mode == "full"
+        self.num_sublayers = config.n_layer * 2
         self.window_sizes = self._compute_window_sizes(config)
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
@@ -143,6 +191,7 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
+        self.depth_mixer = DepthMixer(config, self.num_sublayers + 1) if self.use_attnres else None
         # Value embeddings
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
@@ -236,24 +285,28 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
+        attnres = sum(p.numel() for p in self.depth_mixer.parameters()) if self.depth_mixer is not None else 0
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        total = wte + value_embeds + lm_head + transformer_matrices + attnres + scalars
         return {
             'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
-            'transformer_matrices': transformer_matrices, 'scalars': scalars, 'total': total,
+            'transformer_matrices': transformer_matrices, 'attnres': attnres,
+            'scalars': scalars, 'total': total,
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
         matrix_params = list(self.transformer.h.parameters())
+        attnres_params = list(self.depth_mixer.parameters()) if self.depth_mixer is not None else []
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+            len(lm_head_params) + len(value_embeds_params) + len(resid_params) +
+            len(x0_params) + len(attnres_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -268,6 +321,11 @@ class GPT(nn.Module):
             dict(kind='adamw', subkind='resid', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', subkind='x0', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        if attnres_params:
+            param_groups.append(dict(
+                kind='adamw', subkind='attnres', params=attnres_params, lr=scalar_lr * 0.1,
+                betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
@@ -287,10 +345,30 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)
         x = norm(x)
         x0 = x
-        for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
+        if not self.use_attnres:
+            for i, block in enumerate(self.transformer.h):
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+                x = block(x, ve, cos_sin, self.window_sizes[i])
+        else:
+            residual_outputs = []
+            query_idx = 0
+            for i, block in enumerate(self.transformer.h):
+                ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+
+                hidden = self.depth_mixer.aggregate([x0] + residual_outputs, query_idx)
+                hidden = self.resid_lambdas[i] * hidden + self.x0_lambdas[i] * x0
+                attn_out = block.attn_residual(hidden, ve, cos_sin, self.window_sizes[i])
+                residual_outputs.append(attn_out)
+                query_idx += 1
+
+                hidden = self.depth_mixer.aggregate([x0] + residual_outputs, query_idx)
+                hidden = self.resid_lambdas[i] * hidden + self.x0_lambdas[i] * x0
+                mlp_out = block.mlp_residual(hidden)
+                residual_outputs.append(mlp_out)
+                query_idx += 1
+
+            x = self.depth_mixer.aggregate([x0] + residual_outputs, query_idx)
         x = norm(x)
 
         softcap = 15
@@ -677,6 +755,8 @@ class MuonAdamW(torch.optim.Optimizer):
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+ATTNRES_MODE = "full"   # baseline or full Attention Residuals depth mixing
+ATTNRES_USE_RMSNORM = True
 
 # Optimization
 TOTAL_BATCH_SIZE = 196608 # moderate batch line: more optimizer steps in 5 minutes
@@ -807,6 +887,8 @@ def build_model_config(depth):
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
+        attnres_mode=ATTNRES_MODE,
+        attnres_use_rmsnorm=ATTNRES_USE_RMSNORM,
     )
 
 config = build_model_config(DEPTH)

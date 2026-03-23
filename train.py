@@ -92,6 +92,8 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        # Keep value layout in [B, T, KV, D] for XSA regardless of attention backend.
+        v_for_xsa = v
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
@@ -115,7 +117,7 @@ class CausalSelfAttention(nn.Module):
                 y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0, enable_gqa=True)
             y = y.transpose(1, 2)
         if self.use_xsa:
-            v_q = self._expand_kv_heads(v)
+            v_q = self._expand_kv_heads(v_for_xsa)
             v_hat = F.normalize(v_q, dim=-1, eps=self.xsa_eps)
             y = y - (y * v_hat).sum(dim=-1, keepdim=True) * v_hat
         y = y.contiguous().view(B, T, -1)

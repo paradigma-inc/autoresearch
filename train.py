@@ -861,7 +861,7 @@ EXTRAP_FINAL_MUON_MOMENTUM_DROP = 0.04
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 32   # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 24   # A10-safe per-device batch size; keep total tokens via more accumulation
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
